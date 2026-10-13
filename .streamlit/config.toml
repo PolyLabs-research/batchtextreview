@@ -1,0 +1,87 @@
+# Batch Text Review - Streamlit configuration.
+#
+# Fonts are Streamlit's bundled Source Sans / Source Code ("sans-serif" /
+# "monospace"): no web fonts are fetched, so the app looks the same behind a
+# corporate proxy. Light and dark variants follow the operating system.
+
+[server]
+# This computer only. Streamlit otherwise listens on every network interface,
+# and anyone who can reach the port could use the app and, through it, read
+# files on this disk. To share it on purpose:
+#   batchtextreview ui -- --server.address 0.0.0.0
+address = "localhost"
+maxUploadSize = 1024          # MB - large CSV / Excel exports are common
+runOnSave = false
+# No source watching: this is an installed tool, not a script being edited,
+# and the watcher walks every imported module - including all of
+# transformers' lazy submodules once it is imported (slow, and it logs
+# torchvision import errors).
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "stacktrace"
+
+[theme]
+font = "sans-serif"
+codeFont = "monospace"
+baseRadius = "0.5rem"
+showWidgetBorder = true
+headingFontWeights = [600, 600, 600, 600, 600, 600]
+# h2 = page title, h3 = section / card title, h5 = subsection.
+headingFontSizes = ["2rem", "1.625rem", "1.125rem", "1.0625rem", "1rem", "0.875rem"]
+metricValueFontSize = "1.75rem"
+metricValueFontWeight = 600
+
+[theme.light]
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F7F9"
+textColor = "#1F2937"
+borderColor = "#E5E7EB"
+linkColor = "#4338CA"
+codeTextColor = "#374151"
+codeBackgroundColor = "#F6F7F9"
+dataframeHeaderBackgroundColor = "#F6F7F9"
+# Badge and :color[] text. Streamlit's defaults are 3.2-4.5:1 on their tinted
+# backgrounds; these pass WCAG AA (gray 6.3, orange 4.7, green 6.5, blue 6.7).
+grayTextColor = "#4B5563"
+orangeTextColor = "#B45309"
+greenTextColor = "#166534"
+blueTextColor = "#1D4ED8"
+# Colour-blind safe (Okabe-Ito based), starting indigo / orange / teal.
+chartCategoricalColors = [
+    "#4F46E5", "#E69F00", "#009E73", "#56B4E9", "#D55E00",
+    "#CC79A7", "#0072B2", "#B59B00", "#6B7280", "#8B5CF6",
+]
+# Single-hue indigo ramp, light to dark.
+chartSequentialColors = [
+    "#EEF2FF", "#E0E7FF", "#C7D2FE", "#A5B4FC", "#818CF8",
+    "#6366F1", "#4F46E5", "#4338CA", "#3730A3", "#312E81",
+]
+
+[theme.dark]
+# Light indigo: readable as text on the dark background (6.3:1). White text
+# on it is only 3:1, so ui/styles.py gives filled primary elements (primary
+# buttons, multiselect chips) near-black text in dark mode.
+primaryColor = "#818CF8"
+backgroundColor = "#0D1117"
+secondaryBackgroundColor = "#161B22"
+textColor = "#E6EDF3"
+borderColor = "#30363D"
+linkColor = "#A5B4FC"
+codeTextColor = "#D1D5DB"
+codeBackgroundColor = "#161B22"
+dataframeHeaderBackgroundColor = "#161B22"
+chartCategoricalColors = [
+    "#818CF8", "#F5B342", "#34C79A", "#7CC6F0", "#F07A3A",
+    "#E39AC4", "#4A9EDB", "#E0CB4A", "#9CA3AF", "#B39DFA",
+]
+# Dark to light, so low values blend into the dark background.
+chartSequentialColors = [
+    "#1E1B4B", "#272463", "#312E81", "#3730A3", "#4338CA",
+    "#4F46E5", "#6366F1", "#818CF8", "#A5B4FC", "#C7D2FE",
+]
