@@ -1,0 +1,63 @@
+INDEX,TEXT,GOLD_SENTIMENT,GOLD_INTENT,TIER,CONTESTED,RATIONALE
+1001,The staff at Northgate Library went out of their way to help my son find books for his school project. Thank you all.,positive,praise,1,0,"Explicit thanks, single polarity"
+1002,I have been charged a £4.80 late fee for a book I returned on time. This is the second time it has happened and I want it refunded.,negative,complaint,1,0,"Concrete grievance, repeated fault; refund ask is secondary"
+1003,What time does the Riverside branch open on bank holidays?,neutral,query,1,0,Straightforward question
+1004,Please renew my library card. My membership number is 20456781.,neutral,request,1,0,Simple request for action
+1005,Attached is the signed room hire form for the community hall booking on 14 June.,neutral,other,1,0,"Paperwork sent in, no opinion expressed"
+1006,The new self-service machines are brilliant - borrowing takes seconds now.,positive,praise,1,0,Plainly positive evaluation
+1007,The toilets at the Elm Street branch have been out of order for three weeks. That is not acceptable for a public building.,negative,complaint,1,0,Explicit condemnation of a lasting fault
+1008,"Booking ref RH-20931, Meeting Room 2, 10:00–12:00, 6 attendees.",neutral,other,1,0,"Pure booking data, no sentiment possible"
+1009,Do you still offer free computer classes for the over-65s?,neutral,query,1,0,Simple question
+1010,Could you please post me a copy of the autumn events programme?,neutral,request,1,0,Polite action request phrased as a question
+1011,Absolutely loved the summer reading challenge. My daughter read twelve books and is so proud of her certificate.,positive,praise,1,0,Openly delighted
+1012,Nobody has replied to my three emails about the missing interlibrary loan. Very poor service.,negative,complaint,1,0,"Explicit negative verdict, repeated failure"
+1013,I confirm I have received the replacement library card.,neutral,other,1,0,Simple acknowledgement
+1014,Is the mobile library still stopping at Ashby Green on Thursdays?,neutral,query,1,0,Simple question
+1015,The heating in the reading room was off all morning and several elderly visitors had to leave. Disgraceful.,negative,complaint,1,0,Stated harm plus explicit condemnation
+1016,Huge thanks to Priya at the information desk for helping me fill in my blue badge application.,positive,praise,1,0,Praise for a named staff member
+1017,Please remove my email address from the newsletter mailing list.,neutral,request,1,0,Simple request for action
+1018,+44 7700 900461 is my new daytime number; please update my account.,neutral,request,1,0,Plain request; leading '+' exercises spreadsheet formula protection on export
+1019,,,,1,0,"Empty message body (attachment only) - no text to classify, excluded from scoring"
+1020,Wonderful café in the new library extension – great coffee and a lovely place to read.,positive,praise,1,0,Direct praise; non-ASCII characters
+1021,What time does the Riverside branch open on bank holidays?,neutral,query,1,0,"Exact duplicate of 1003 (form sent twice) - generated once, scored twice"
+1022,"The new opening hours are not at all bad, actually.",positive,praise,2,0,Litotes: 'not at all bad' reads as positive
+1023,"While I appreciate budgets are tight, closing the branch on Saturdays rather defeats the purpose for working families.",negative,complaint,2,0,"Courtesy preamble, core is a complaint"
+1024,The website isn’t entirely clear about whether e-books count towards the borrowing limit – could someone clarify?,neutral,query,2,1,Information-seeking; mild criticism of the website - arguably negative
+1025,Hard to find anything to criticise in how the staff dealt with the flood in the children’s section.,positive,praise,2,0,Positive via negated criticism
+1026,"The storytime sessions are lovely, although the room is far too small for the numbers who turn up.",mixed,complaint,2,1,Real praise alongside a real grievance; intent arguably other (no explicit ask)
+1027,It would be nice if the lift at Elm Street worked for more than a week at a time.,negative,complaint,2,0,Complaint dressed as a wish
+1028,I wish to register my formal dissatisfaction with the handling of my reservation request.,negative,complaint,2,0,"Formal register, unambiguous complaint"
+1029,"It took a while to reach anyone, but once I did the parking permit was sorted the same afternoon.",positive,praise,2,1,"Early delay noted, outcome praised - arguably mixed"
+1030,"Well, the new catalogue search finds books faster than the old one. Low bar, admittedly.",mixed,other,2,1,Grudging acknowledgement with a dig - arguably weak positive
+1031,I wouldn’t say the refurbishment has been an unqualified success.,negative,complaint,2,0,Understatement resolving negative
+1032,"Your reply came back within the hour, which I appreciated – shame it was about a completely different library card.",mixed,complaint,2,1,"Speed praised, substance wrong - arguably negative-dominant"
+1033,The home delivery service has never once let me down; the books turn up every other Tuesday like clockwork.,positive,praise,2,0,Praise expressed through a negative ('never once let me down')
+1034,A little more notice of the branch closure than a sign on the door the night before would not have gone amiss.,negative,complaint,2,0,Classic understatement
+1035,"The author evening was fine. Nothing to write home about, but fine.",neutral,other,2,1,Lukewarm verdict - arguably weak positive or mixed
+1036,We would be grateful if the large-print order for the care home could be ready before the end of the month.,neutral,request,2,0,"Polite request; expectation, not evaluation"
+1037,"Given how the last consultation went, I suppose I shouldn’t be surprised that this one was publicised two days before it closed.",negative,complaint,2,0,"Resigned tone, implicit criticism of the process"
+1038,"The volunteer at the desk was patient and kind; the booking system, on the other hand, crashed twice and lost my reservation.",mixed,complaint,2,0,"Staff member praised, process criticised"
+1039,"Collected my reserved books today and, for once, they were actually on the shelf.",positive,other,2,1,'For once' barb; current experience positive - arguably mixed
+1040,It has been brought to my attention that the hearing loop in the main hall is still not working.,negative,complaint,2,0,"Formal, mild register; negative core"
+1041,"Provided the new shelving goes in over the summer as planned, the local history group will be happy to move its collection back.",neutral,other,2,0,"Conditional satisfaction, not yet realised"
+1042,Bardzo dziękuję za pomoc przy wyrobieniu karty bibliotecznej – pani przy ladzie była przemiła.,positive,praise,2,0,Non-English (Polish) thanks to a staff member
+1043,Fantastic. The online booking system is down for the fourth weekend running. Really embracing the digital age.,negative,complaint,3,0,"Sarcasm: positive words, negative meaning"
+1044,Forty minutes queuing to return a single book – exactly how I hoped to spend my lunch break.,negative,complaint,3,0,Irony: stated wish is the opposite of meaning
+1045,How is anyone without a smartphone supposed to book a computer session now that the phone line has gone?,negative,complaint,3,0,"Rhetorical question - a complaint, not a query"
+1046,A water pipe burst above the local studies room overnight; around 300 archive boxes have been moved to the basement as a precaution.,neutral,other,3,0,"Bad news reported matter-of-factly"
+1047,"Our reading group has just celebrated its tenth anniversary! I’m attaching a photo for the newsletter, if there’s room.",positive,request,3,1,"Positive about own group, not the service; soft request - arguably other"
+1048,Many thanks for the twelve-page consultation document. I particularly enjoyed the part where our views were sought after the decision was made.,negative,complaint,3,0,Ironic thanks
+1049,"The refund for the cancelled course arrived promptly, which I appreciate, but it was £15 less than I paid – was a booking fee deducted?",mixed,query,3,1,Real positive plus real problem; intent arguably complaint
+1050,"Incident report attached: ceiling tile fell in the children’s area at 15:40, no injuries, area cordoned off.",neutral,other,3,0,"Alarming content, administrative stance"
+1051,"Really impressed with the revamped children’s library. My only quibble is the temperamental hand dryer, and honestly that’s nitpicking.",positive,praise,3,1,Trivial caveat should not force 'mixed' - dominance boundary
+1052,"Thank you for your apology. However, it is now five weeks since my complaint, the overdue charges are still on my account, and the reminder letters keep coming.",negative,complaint,3,0,Polite opening does not make it mixed
+1053,The council says the delay is down to the contractor and the contractor says it is down to the council. I have stopped asking which of you to believe.,negative,complaint,3,1,Frustration and distrust - arguably neutral resignation
+1054,I came armed with a flask and a novel for the usual wait at the counter and was out in five minutes. Barely got past the first page.,positive,praise,3,0,Mock complaint wrapped around genuine praise
+1055,"Your letter says I returned the DVD ‘damaged beyond use’. It was in exactly the state I borrowed it in, and I have a photo to prove it.",negative,complaint,3,0,Dispute; the quoted words belong to the service
+1056,"Unless the £60 replacement charge is withdrawn by 30 November, I will be taking the matter to the ombudsman.",negative,complaint,3,0,"Measured tone, serious complaint"
+1057,Half the new audiobook titles download perfectly; the other half stop playing after ten minutes.,mixed,complaint,3,1,Evenly split; intent arguably query
+1058,"Following my recent redundancy, am I eligible for the reduced-rate leisure pass, and what proof do I need to bring?",neutral,query,3,0,"Difficult personal context, neutral administrative ask"
+1059,"I’ve written to this inbox to grumble more times than I can count, so for the record: the new mobile library timetable works perfectly for our village.",positive,praise,3,0,"Earlier problems are background, not the current view"
+1060,The website says the branch closes at 7pm. The sign on the door says 6pm. The staff told me 5.30.,negative,complaint,3,1,Implicit grievance by juxtaposition - arguably neutral reporting
+1061,"Who knew a library could run a better coding club than my son’s school? Genuinely brilliant, thank you.",positive,praise,3,0,Rhetorical question carrying praise
+1062,None,neutral,other,3,0,"The word 'None' typed into a comments box - must load as text, not a missing value"

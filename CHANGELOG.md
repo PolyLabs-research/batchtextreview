@@ -1,0 +1,113 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
+[Semantic Versioning](https://semver.org/).
+
+## [2.0.0] - 2026-10-12
+
+A ground-up rebuild of the version 1 tool as an installable package, with a new interface, a
+results database, proper evaluation and a command line. See [docs/MIGRATING.md](docs/MIGRATING.md)
+for upgrade steps.
+
+### Added
+
+- Installable package (`pip install -e .`) with a `batchtextreview` command. Its subcommands are
+  `ui`, `run` (headless runs), `models`, `presets`, `history` (printed, or saved as CSV or Excel
+  with `--output`), `import-legacy` and `device`.
+- A documented Python API (`engine.RunConfig.build` and `engine.execute_run`) for scripts and
+  notebooks, replacing `llm_batch.run_batch`.
+- Four-page Streamlit app (Run, Results, History, Models & settings) with light and dark themes.
+- Input from upload, any folder, or bundled sample data, in CSV, TSV, TXT, Excel (with sheet
+  choice), Parquet, JSON and JSON Lines. Encoding and delimiter are detected. The text, ID and
+  gold-label columns are selectable, and a sensible default is guessed for each.
+- Row scope: All, First rows, or a repeatable Random sample.
+- Task presets grouped by category, an editable prompt with live validation and preview, editable
+  allowed answers, exact-match scoring for open-ended tasks, and saved custom presets.
+- Any Hugging Face repo id or local model folder as a custom model. A demo model
+  (`batchtextreview ui --demo` or `BTR_DEMO=1`) for trying the app without a GPU.
+- **Weights** (precision) choice: Auto, 4-bit, fp16 or fp32 (and bf16 on the command line, as
+  `--precision`). Auto picks what the device supports.
+- Background runs with live progress, rows per second, time remaining and Cancel. A run plan
+  shows how many rows are already saved before you start, and **Discard saved outputs** deletes
+  them for that configuration.
+- A `NOTE` column flags texts cut to the max input characters and outputs that reached the max
+  output tokens ("output may be cut off"). The flag is saved with each output, so it also shows
+  for saved results.
+- Results view with filters (wrong, invalid, errors, blank), search, a row detail panel showing
+  the exact prompt, a label distribution, and JSON outputs expanded into one column per key.
+- Evaluation: accuracy, macro-F1, Cohen's kappa, valid-answer rate and coverage, a clickable
+  confusion matrix, per-class precision, recall and F1, and accuracy by slice. Flagged rows (for
+  example `CONTESTED`) can be excluded from the headline numbers.
+- History leaderboard with filters and charts, and a change-since-last-run figure on the
+  evaluation tiles.
+- Excel export, alongside CSV.
+- One-click (History page) and command-line import of version 1 checkpoints and `evals.csv`.
+- Configuration through environment variables: `BTR_RESULTS_DIR`, `BTR_DATA_DIR`, `BTR_DEMO`,
+  `BTR_VERBOSE` and `BTR_NO_TRUSTSTORE`.
+- A log file, `results/logs/batchtextreview.log` (1 MB, three old copies kept), written by the app
+  and the command line. Model-load failures are logged in full. `batchtextreview -v` or
+  `BTR_VERBOSE=1` adds debug details and prints them in the terminal too.
+- Command-line options `run --sheet` (Excel sheet), `ui --demo`, `ui --results-dir` and
+  `import-legacy FOLDER` (the version 1 folder to import from).
+- Gold-labelled sample dataset (`examples/sample_feedback.csv`), a conda environment file for
+  CUDA, a test suite, and CI on Ubuntu and Windows.
+
+### Changed
+
+- The app only accepts connections from this computer (`server.address = "localhost"`).
+  Version 1 used Streamlit's default, every network interface. To share it on a trusted network:
+  `batchtextreview ui -- --server.address 0.0.0.0`.
+- Saved outputs and evaluation history are kept in one SQLite database
+  (`results/batchtextreview.db`). This replaces the per-configuration parquet and JSON files and
+  `evals.csv`. Writes are incremental: version 1 rewrote the whole checkpoint after every batch.
+  The database records its schema version (3). A database from an earlier build is upgraded in
+  place when opened, and one written by a newer version is refused rather than changed.
+- Run ids hash the model's repo id instead of its display label, so model names can change
+  without orphaning saved outputs. For a local model folder they also include a fingerprint of
+  its model files (names, sizes, modification times), so saving new weights into the same folder
+  starts a fresh run. Model labels no longer carry hints such as "(fastest)"; these are shown as
+  badges, and imported history is mapped to the new names.
+- Failed rows are recorded in new `STATUS` and `ERROR` columns, and `OUTPUT` stays empty. Failed,
+  blank and not-run rows are excluded from scoring instead of being counted as wrong.
+- `LABEL` is empty for rows that can't be scored. `[invalid]` is reserved for real outputs that
+  don't resolve to an allowed answer.
+- Answer matching ignores lead-ins such as "Answer:", is negation-aware, handles scores such as
+  "4/5" and numbers such as "3.0", and never guesses between two labels.
+- Evaluation history has one line per configuration, data, gold column and label set. Re-scoring
+  updates the line instead of appending a duplicate.
+- CSV downloads are UTF-8 with BOM, so Excel shows non-ASCII text correctly. Download names
+  describe their contents. The command line's default results file is
+  `<input>_<preset>_<model>_results.csv`, so runs of different models don't replace each other.
+- The default folder is no longer hard-coded. It is `BTR_DATA_DIR`, then the last folder used.
+- Output columns never overwrite existing ones. Running on an exported file adds `OUTPUT_2` and so
+  on.
+
+### Fixed
+
+- Results disappeared on any interaction (a download click, a widget change). They now persist.
+- A long run was killed by any widget interaction and could not be cancelled.
+- A failed model switch left the previous model's name pointing at freed weights, so every later
+  run with that model failed.
+- Model-load errors escaped as raw tracebacks. They are now a clean message with a suggested fix
+  (licence and `HF_TOKEN`, out of memory, missing package, outdated `transformers`, network).
+- 4-bit loading was forced on CPU and macOS, where it crashes.
+- Tokenizers without a chat template made every batch fail.
+- The end-of-sequence token was used for padding even when the tokenizer has its own pad token.
+- `<think>` blocks from reasoning models leaked into outputs.
+- Missing gold values became the text "nan" and were scored. Numeric gold values read as "3.0"
+  matched "3" only by chance.
+- Texts reading "NA" or "None" were loaded as missing values. Excel exports with a BOM, or
+  Windows-1252 encoding, broke the first column name or failed to load.
+- A `{var}` value containing `{text}` was expanded once per row.
+- Two browser sessions shared one model without a lock.
+- The results folder depended silently on the current directory, and the run manifest was never
+  updated.
+- Exported cells starting with `=`, `+`, `-` or `@` could run as spreadsheet formulas.
+
+## [1.0.0]
+
+The original single-folder tool (`app.py` + `llm_batch.py`, "Corpus LLM Runner"): run a prompt
+over the `TEXT` column of a CSV with a local 4-bit model, checkpoint outputs per configuration,
+and score the outputs against a gold column.
+

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# App data - results database, version-1 checkpoints, local inputs
+results/
+*.db
+*.db-wal
+*.db-shm
+data/
+# "batchtextreview run" writes <input>_<preset>_<model>_results.csv next to its input
+*_results.csv
+*_results.xlsx
+
+# Local secrets (HF_TOKEN and the like)
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Streamlit secrets
+.streamlit/secrets.toml
