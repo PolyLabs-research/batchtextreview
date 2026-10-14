@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import itertools
 import logging
 import math
 import os
@@ -561,29 +562,97 @@ def test_row_text_with_placeholders_is_inserted_verbatim():
 # --------------------------------------------------------------------------
 
 
-def test_batches_sorted_by_length_with_stable_ties():
-    texts = ["cccc", "a", "bb", "x", "dddddd", "y"]
-    _, manager = run(texts, batch_size=2)
-    assert manager.backend.calls == [
-        ["Q: a", "Q: x"],
-        ["Q: y", "Q: bb"],
-        ["Q: cccc", "Q: dddddd"],
-    ]
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [
+        ("longest", [["Q: cccc", "Q: dddd"], ["Q: bb", "Q: ee"], ["Q: a", "Q: x"], ["Q: y"]]),
+        ("shortest", [["Q: a", "Q: x"], ["Q: y", "Q: bb"], ["Q: ee", "Q: cccc"], ["Q: dddd"]]),
+    ],
+)
+def test_batches_sorted_by_length_with_stable_ties(order, expected):
+    # Ties at both ends keep first-seen order, whichever way the sort runs.
+    texts = ["cccc", "a", "bb", "x", "dddd", "y", "ee"]
+    result, manager = run(texts, batch_size=2, order=order)
+    assert manager.backend.calls == expected
+    assert result.outputs == [answer(f"Q: {text}") for text in texts]
+
+
+def test_default_order_is_longest_first():
+    assert engine.DEFAULT_ORDER == "longest"
+    assert engine.ORDERS == ("longest", "shortest")
+    assert engine.ORDER_LABELS == {"longest": "Longest first", "shortest": "Shortest first"}
+    texts = ["a", "ccc", "bb"]
+    _, default = run(texts, batch_size=1)
+    _, longest = run(texts, batch_size=1, order="longest")
+    assert default.backend.calls == longest.backend.calls == [["Q: ccc"], ["Q: bb"], ["Q: a"]]
+
+
+@pytest.mark.parametrize("order", ["longest", "shortest"])
+def test_first_batch_holds_the_longest_or_shortest_texts(order):
+    # 40 distinct lengths in no particular order.
+    texts = [f"{i:02d}" + "w" * (i * 37 % 50) for i in range(40)]
+    result, manager = run(texts, batch_size=8, max_batch_chars=10**6, order=order)
+    by_length = sorted((len(text) for text in texts), reverse=order == "longest")
+    first = sorted(len(prompt) - len("Q: ") for prompt in manager.backend.calls[0])
+    assert first == sorted(by_length[:8])
+    assert result.outputs == [answer(f"Q: {text}") for text in texts]
+
+
+@pytest.mark.parametrize("order", ["random", "Longest", "longest first", "", None])
+def test_unknown_order_is_rejected_up_front(order):
+    store = FakeStore()
+    manager = FakeManager()
+    events: list[Progress] = []
+    with pytest.raises(ValueError, match="'longest' or 'shortest'"):
+        run(["a"], store=store, manager=manager, order=order, progress=events.append)
+    assert manager.acquired == 0
+    assert store.get_calls == 0 and store.runs == {}
+    assert events == []
+
+
+def test_order_is_not_part_of_the_run_id():
+    store = FakeStore()
+    texts = ["a", "bbb", "cc", "dddd"]
+    cancel = threading.Event()
+
+    def stop_after_first_batch(progress: Progress) -> None:
+        if progress.phase == "generating" and progress.generated_rows:
+            cancel.set()
+
+    first, _ = run(
+        texts,
+        store=store,
+        batch_size=2,
+        order="longest",
+        cancel=cancel,
+        progress=stop_after_first_batch,
+    )
+    assert first.statuses == ["pending", "generated", "pending", "generated"]
+    # Resumed the other way round: the same run, only what is left runs.
+    resumed, manager = run(texts, store=store, batch_size=2, order="shortest")
+    assert resumed.run_id == first.run_id
+    assert manager.backend.prompts == ["Q: a", "Q: cc"]
+    assert resumed.statuses == ["generated", "cached", "generated", "cached"]
+    assert list(store.runs) == [first.run_id]
+    again, manager = run(texts, store=store, order="longest")
+    assert manager.acquired == 0 and again.outputs == resumed.outputs
 
 
 def test_both_caps_apply_in_execute_run():
     texts = ["aa", "bb", "cc", "dd", "eeeeeeeeee"]
     _, manager = run(texts, batch_size=3, max_batch_chars=5)
     sizes = [len(call) for call in manager.backend.calls]
-    # 2+2 = 4 fits 5 chars, a third row would not; the 10-char row is alone.
-    assert sizes == [2, 2, 1]
-    assert manager.backend.calls[-1] == ["Q: eeeeeeeeee"]
+    # The 10-char row is alone; 2+2 = 4 fits 5 chars, a third row would not.
+    assert sizes == [1, 2, 2]
+    assert manager.backend.calls[0] == ["Q: eeeeeeeeee"]
 
 
-def test_oversize_row_still_runs():
+@pytest.mark.parametrize("order", ["longest", "shortest"])
+def test_oversize_row_still_runs(order):
     long_text = "z" * 50
-    result, manager = run(["a", long_text], max_batch_chars=10)
-    assert manager.backend.calls == [["Q: a"], [f"Q: {long_text}"]]
+    result, manager = run(["a", long_text], max_batch_chars=10, order=order)
+    calls = [[f"Q: {long_text}"], ["Q: a"]]
+    assert manager.backend.calls == (calls if order == "longest" else calls[::-1])
     assert result.statuses == ["generated", "generated"]
 
 
@@ -900,37 +969,174 @@ def test_eta_is_not_fooled_by_duplicate_rows(monkeypatch):
 
 
 def test_eta_prices_the_longer_batches_still_to_come(monkeypatch):
-    """Regression: batches run shortest first, so a rate from the first
-    batches promised far too little time for the long ones left."""
+    """Regression: shortest first, a rate from the first batches promised
+    far too little time for the long ones left."""
     clock = FakeClock()
     texts = ["w" * (5 * i + 1) for i in range(200)]
     backend = TimedBackend(clock, per_call=0.6, per_char=0.002)
     _, end, generating = timed_run(
-        monkeypatch, texts, backend, clock, batch_size=8, max_batch_chars=2000
+        monkeypatch, texts, backend, clock, batch_size=8, max_batch_chars=2000, order="shortest"
     )
-    # From the second batch on (two lengths seen), the cost model is exact.
-    for t, progress in generating[1:]:
-        assert progress.eta_s == pytest.approx(end - t, rel=1e-6, abs=1e-9)
+    errors = [progress.eta_s - (end - t) for t, progress in generating]
+    # From the second batch on (two lengths seen) the cost model is exact, so
+    # each report keeps 70% of the error the one before had.
+    assert errors[0] < 0
+    for before, after in itertools.pairwise(errors[:-1]):
+        assert after == pytest.approx(0.7 * before, abs=1e-9)
+    assert errors[-1] == 0  # every batch started
     # The old estimate (rows left / rows per second) was over 3x too low here.
     t, tenth = next((t, p) for t, p in generating if p.fraction >= 0.1)
     assert (200 - tenth.done_rows) / tenth.rows_per_s < (end - t) / 3
 
 
-def test_eta_estimate_stays_between_per_call_and_per_char_pricing():
-    eta = engine._Eta([100, 100, 400, 800])
+def test_eta_counts_down_when_the_longest_texts_go_first(monkeypatch):
+    """What longest first is for: the estimate starts high and only falls."""
+    clock = FakeClock()
+    texts = ["w" * (5 * i + 1) for i in range(200)]
+    backend = TimedBackend(clock, per_call=0.6, per_char=0.002)
+    _, end, generating = timed_run(
+        monkeypatch, texts, backend, clock, batch_size=8, max_batch_chars=2000, order="longest"
+    )
+    estimates = [progress.eta_s for _, progress in generating]
+    assert estimates == sorted(estimates, reverse=True)
+    first_t, _ = generating[0]
+    assert estimates[0] >= end - first_t
+    # And it closes in on the real time left long before the end.
+    t, half = next((t, p) for t, p in generating if p.work_fraction >= 0.5)
+    assert half.eta_s == pytest.approx(end - t, rel=0.01)
+    assert estimates[-1] == 0
+
+
+def test_eta_counts_down_longest_first_through_texts_of_one_length(monkeypatch):
+    """Regression: longest first, the texts cut to the max input characters
+    come first, all of one length, so their batches can't tell the cost per
+    call from the cost per character. The middle of the two prices then put
+    the shorter batches after them far too low when decoding dominates (long
+    outputs): the estimate started low and rose once the lengths began to
+    differ, and the bar stood still meanwhile."""
+    clock = FakeClock()
+    cut = [f"{i:03d}" + "w" * 1200 for i in range(40)]  # cut to 1,000 characters
+    texts = cut + ["w" * (i + 1) for i in range(120)]
+    backend = TimedBackend(clock, per_call=1.0, per_char=0.0001)
+    _, end, generating = timed_run(
+        monkeypatch,
+        texts,
+        backend,
+        clock,
+        config=make_config(max_input_chars=1000),
+        batch_size=8,
+        max_batch_chars=2000,
+        order="longest",
+    )
+    first_t, first = generating[0]
+    assert first.eta_s >= end - first_t  # starts high...
+    estimates = [progress.eta_s for _, progress in generating]
+    assert estimates == sorted(estimates, reverse=True)  # ... and only falls
+    work = [progress.work_fraction for _, progress in generating]
+    assert all(after > before for before, after in itertools.pairwise(work[:-1]))
+    assert estimates[-1] == 0 and work[-1] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("batch_chars", "seen", "low_end"),
+    [
+        # Shortest first: what is left is longer, per call is the low end.
+        ([100, 100, 400, 800], [(100, 1.0), (110, 5.0)], "per call"),
+        # Longest first: what is left is shorter, per character is the low end.
+        ([800, 400, 100, 100], [(800, 5.0), (780, 6.0)], "per char"),
+    ],
+)
+def test_eta_estimate_stays_between_per_call_and_per_char_pricing(batch_chars, seen, low_end):
+    longest_first = low_end == "per char"
+    eta = engine._Eta(batch_chars, longest_first=longest_first)
     assert eta.seconds_left() is None
+    (c1, t1), (c2, t2) = seen
+    eta.start_batch(batch_chars[0])
+    eta.observe(c1, t1)
+    # One length seen: a + b can't be told apart -> longest first the high
+    # end (per call), shortest first the middle of the range.
+    rest = sum(batch_chars[1:])
+    per_call, per_char = t1 * 3, t1 / c1 * rest
+    expected = per_call if longest_first else math.sqrt(per_call * per_char)
+    assert eta.seconds_left() == pytest.approx(expected)
+    eta.start_batch(batch_chars[1])
+    eta.observe(c2, t2)  # noisy: the slope alone would be far off
+    rest = sum(batch_chars[2:])
+    per_call, per_char = (t1 + t2) / 2 * 2, (t1 + t2) / (c1 + c2) * rest
+    assert (per_call < per_char) == (low_end == "per call")
+    low, high = sorted((per_call, per_char))
+    assert low <= eta.seconds_left() <= high
+    eta.start_batch(batch_chars[2])
+    eta.start_batch(batch_chars[3])
+    assert eta.seconds_left() == 0.0
+
+
+def test_eta_report_is_smoothed_and_counts_down():
+    eta = engine._Eta([100] * 5)
+    assert eta.report(now=0.0) is None
+    eta.start_batch(100)
+    eta.observe(100, 10.0)
+    # The first report is the fit itself: 4 calls left at 10 s.
+    assert eta.report(now=10.0) == pytest.approx(40.0)
+    # Right on time: the previous report counted down is the fit, kept as is.
+    eta.start_batch(100)
+    eta.observe(100, 10.0)
+    assert eta.seconds_left() == pytest.approx(30.0)
+    assert eta.report(now=20.0) == pytest.approx(30.0)
+    # A slow batch: the fit jumps to 2 calls at 50/3 s, the report moves 30%
+    # of the way from the previous one counted down (30 - 30 s).
+    eta.start_batch(100)
+    eta.observe(100, 30.0)
+    assert eta.seconds_left() == pytest.approx(100 / 3)
+    assert eta.report(now=50.0) == pytest.approx(0.3 * 100 / 3 + 0.7 * 0.0)
+    # Asked again 4 s later with nothing new: 0.3 x fit + 0.7 x (10 - 4).
+    assert eta.report(now=54.0) == pytest.approx(0.3 * 100 / 3 + 0.7 * 6.0)
+    # Once every batch has started it is 0, smoothing or not.
+    eta.start_batch(100)
+    eta.start_batch(100)
+    assert eta.report(now=55.0) == 0.0
+    assert eta.report(now=56.0) == 0.0
+
+
+@pytest.mark.parametrize("order", ["longest", "shortest"])
+def test_eta_of_lengths_too_alike_to_price_apart(order):
+    """While every call so far had one length, longest first prices the rest
+    per call (the high end: the calls left are no longer than those so far),
+    shortest first takes the middle of the range (pricing per character, the
+    high end there, can be many times too much after very short texts)."""
+    batch_chars = [800, 800, 400, 100] if order == "longest" else [100, 100, 400, 800]
+    eta = engine._Eta(batch_chars, longest_first=order == "longest")
+    for chars in batch_chars[:2]:
+        eta.start_batch(chars)
+        eta.observe(chars, 2.0)
+    per_call, per_char = 2.0 * 2, 4.0 / (2 * batch_chars[0]) * sum(batch_chars[2:])
+    expected = max(per_call, per_char) if order == "longest" else math.sqrt(per_call * per_char)
+    assert eta.seconds_left() == pytest.approx(expected)
+
+
+def test_eta_prices_the_prompts_of_a_failed_batch_retried_alone():
+    eta = engine._Eta([30, 30], smoothing=1.0, longest_first=True)
+    eta.start_batch(30)
+    eta.observe(30, 3.0)
+    eta.start_batch(30)  # the last batch fails: nothing left to price...
+    assert eta.seconds_left() == 0.0
+    eta.requeue([10, 10, 10])  # ... but its 3 prompts will be retried alone
+    assert eta.seconds_left() == pytest.approx(9.0)  # 3 calls at 3 s
+    eta.start_batch(10)
+    assert eta.report(now=1.0) == pytest.approx(6.0)
+    eta.start_batch(10)
+    eta.start_batch(10)  # the last one starts (or is marked failed unretried)
+    assert eta.seconds_left() == 0.0 == eta.report(now=2.0)
+
+
+def test_eta_smoothing_can_be_turned_off():
+    eta = engine._Eta([100] * 3, smoothing=1.0)
     eta.start_batch(100)
     eta.observe(100, 1.0)
-    # One length seen: a + b can't be told apart -> the middle of the range
-    # (3 calls at 1 s, or 1,300 chars at 0.01 s).
-    assert eta.seconds_left() == pytest.approx(math.sqrt(3.0 * 13.0))
+    assert eta.report(now=1.0) == pytest.approx(2.0)
     eta.start_batch(100)
-    eta.observe(110, 5.0)  # noisy: the slope alone would predict ~500 s
-    per_call, per_char = 3.0 * 2, 6.0 / 210 * 1200
-    assert per_call <= eta.seconds_left() <= per_char
-    eta.start_batch(400)
-    eta.start_batch(800)
-    assert eta.seconds_left() == 0.0
+    eta.observe(100, 9.0)
+    assert eta.report(now=10.0) == pytest.approx(eta.seconds_left()) == pytest.approx(5.0)
 
 
 def test_no_rate_while_every_batch_fails():
@@ -970,6 +1176,129 @@ def test_fraction_below_one_when_cancelled():
     run(["a", "b"], batch_size=1, cancel=cancel, progress=on_progress)
     assert events[-1].phase == "finished"
     assert events[-1].fraction == 0.5
+    assert events[-1].work_fraction < 1.0
+
+
+def test_work_fraction_is_generation_time_over_the_whole_else_rows():
+    p = Progress(phase="generating", total_rows=10, done_rows=2, generation_s=30.0, eta_s=70.0)
+    assert p.fraction == 0.2
+    assert p.work_fraction == pytest.approx(0.3)
+    # No estimate yet, not generating, or nothing to divide by: rows.
+    assert dataclasses.replace(p, eta_s=None).work_fraction == 0.2
+    assert dataclasses.replace(p, phase="loading").work_fraction == 0.2
+    assert dataclasses.replace(p, phase="finished").work_fraction == 0.2
+    assert dataclasses.replace(p, generation_s=0.0, eta_s=0.0).work_fraction == 0.2
+    # The engine's own figure wins.
+    assert dataclasses.replace(p, work_done=0.25).work_fraction == 0.25
+    assert Progress(phase="planning", total_rows=0).work_fraction == 1.0
+
+
+class StepBackend(ScriptedBackend):
+    """Each generate call advances the clock by the next of ``seconds``."""
+
+    def __init__(self, clock: FakeClock, seconds: Sequence[float]) -> None:
+        super().__init__()
+        self.clock, self.seconds = clock, iter(seconds)
+
+    def generate(self, prompts, max_new_tokens):
+        self.clock.now += next(self.seconds)
+        return super().generate(prompts, max_new_tokens)
+
+
+def test_work_fraction_never_goes_down_and_ends_at_one(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(engine, "time", clock)
+    # One slow call among quick ones: the time left jumps, then shrinks fast.
+    backend = StepBackend(clock, [1.0, 1.0, 30.0] + [1.0] * 17)
+    events: list[Progress] = []
+    texts = [f"t{i:02d}" for i in range(20)]
+    result, _ = run(texts, manager=FakeManager(backend), batch_size=1, progress=events.append)
+    work = [e.work_fraction for e in events]
+    assert work == sorted(work)
+    # ... although generation time over the whole dips after the slow call.
+    measured = [dataclasses.replace(e, work_done=None).work_fraction for e in events]
+    assert any(after < before for before, after in itertools.pairwise(measured))
+    assert events[-1].phase == "finished" and work[-1] == 1.0
+    assert [e.generation_s for e in events][-1] == pytest.approx(result.stats.generation_s)
+    assert result.stats.generation_s == pytest.approx(49.0)
+    generating = [e for e in events if e.phase == "generating" and e.generated_rows]
+    assert [e.generation_s for e in generating][:3] == pytest.approx([1.0, 2.0, 32.0])
+
+
+def test_work_stays_below_one_while_a_failed_batch_is_retried(monkeypatch):
+    """Regression: the prompts of a failed batch, retried one at a time, were
+    left out of the time left, so the bar read 100% while the last batch was
+    retried row by row (and ran ahead while one was retried mid-run)."""
+    clock = FakeClock()
+    backend = TimedBackend(clock, per_call=1.0)
+    backend.fail_when = lambda n, prompts: any(p.endswith("t31") for p in prompts)
+    texts = [f"t{i:02d}" for i in range(32)]
+    result, end, generating = timed_run(monkeypatch, texts, backend, clock, batch_size=8)
+    assert result.stats.generated == 31 and result.stats.errors == 1
+    assert len(backend.calls) == 4 + 8 and end == pytest.approx(12.0)
+    retries = [p for _, p in generating if "one at a time" in p.message]
+    assert len(retries) == 8
+    assert all(p.eta_s > 0 for p in retries[:-1]) and retries[-1].eta_s == 0
+    unfinished = [p for _, p in generating if p.done_rows < p.total_rows]
+    assert len(unfinished) == 3 + 7
+    assert all(p.work_fraction < 1.0 for p in unfinished)
+    work = [p.work_fraction for _, p in generating]
+    assert work == sorted(work) and work[-1] == 1.0
+
+
+def test_prompts_failed_without_a_retry_leave_the_time_left(monkeypatch):
+    """When a failed batch's first two prompts fail alone the same way, the
+    rest are marked failed unretried: they are no longer work to come."""
+    clock = FakeClock()
+    backend = TimedBackend(clock, per_call=1.0)
+    backend.fail_when = lambda n, prompts: any("bad" in p for p in prompts)
+    texts = ["bad0", "bad1"] + [f"x{i:02d}" for i in range(2, 16)]
+    result, _, generating = timed_run(
+        monkeypatch, texts, backend, clock, batch_size=8, max_consecutive_failures=0
+    )
+    assert result.stats.errors == 8 and result.stats.generated == 8
+    assert len(backend.calls) == 1 + 2 + 1
+    last = generating[-1][1]
+    assert last.eta_s == 0 and last.work_fraction == 1.0
+
+
+def test_work_done_counts_rows_that_need_no_model_as_done(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(engine, "time", clock)
+    config = make_config()
+    store = FakeStore()
+    store.seed(config, "a", "A")
+    store.seed(config, "b", "B")
+    events: list[Progress] = []
+    run(
+        [None, "a", "b", "cc", "dd"],
+        store=store,
+        manager=FakeManager(TimedBackend(clock, per_call=1.0)),
+        batch_size=1,
+        progress=events.append,
+    )
+    planning = events[0]
+    assert planning.work_fraction == pytest.approx(0.6)  # 1 blank + 2 saved of 5
+    after_first = next(e for e in events if e.phase == "generating" and e.generated_rows)
+    # 1 s spent, 1 s left: half of the other 40%.
+    assert after_first.eta_s == pytest.approx(1.0)
+    assert after_first.work_fraction == pytest.approx(0.6 + 0.4 * 0.5)
+    assert events[-1].work_fraction == 1.0
+
+
+def test_work_done_of_a_stopped_run_keeps_its_highest_value():
+    cancel = threading.Event()
+    events: list[Progress] = []
+
+    def on_progress(p: Progress) -> None:
+        events.append(p)
+        if p.phase == "generating" and p.generated_rows:
+            cancel.set()
+
+    run(["a", "bb", "ccc"], batch_size=1, cancel=cancel, progress=on_progress)
+    finished = events[-1]
+    assert finished.phase == "finished" and finished.eta_s is None
+    assert finished.work_fraction == max(e.work_fraction for e in events) < 1.0
 
 
 class StopRun(Exception):
@@ -1108,7 +1437,7 @@ def test_stats_arithmetic_with_every_status():
     config = make_config()
     store = FakeStore()
     store.seed(config, "c", "cached")
-    # Batches (batch_size 1, length order): "c" is cached; then "dd" ok,
+    # Batches (batch_size 1, shortest first): "c" is cached; then "dd" ok,
     # "ee" fails, "ff" fails -> abort; "gggg" never runs.
     backend = ScriptedBackend(fail_when=lambda n, p: n >= 2)
     texts = [None, "c", "dd", "ee", "ff", "gggg", "dd", "c", ""]
@@ -1117,6 +1446,7 @@ def test_stats_arithmetic_with_every_status():
         store=store,
         manager=FakeManager(backend),
         batch_size=1,
+        order="shortest",
         max_consecutive_failures=2,
     )
     s = result.stats
@@ -1276,7 +1606,7 @@ def test_real_store_records_cli_source(tmp_path):
 def test_progress_recent_holds_the_latest_pairs_newest_last():
     events: list[Progress] = []
     texts = ["a", "bb", "ccc", "dddd", "eeeee", "ffffff", "ggggggg"]
-    run(texts, batch_size=2, progress=events.append)
+    run(texts, batch_size=2, order="shortest", progress=events.append)
     assert events[0].phase == "planning" and events[0].recent == ()
     first = next(e for e in events if e.phase == "generating" and e.generated_rows)
     assert first.recent == (("a", "A:A"), ("bb", "A:BB"))
@@ -1588,7 +1918,7 @@ def test_hit_token_limit_is_stored_and_kept_for_cached_rows():
 
 def test_hit_token_limit_survives_a_cancel_and_resume():
     store = FakeStore()
-    texts = ["ax", "b", "cccx", "dddd"]  # batches (by length): [b, ax], [cccx, dddd]
+    texts = ["ax", "b", "cccx", "dddd"]  # batches (shortest first): [b, ax], [cccx, dddd]
     cancel = threading.Event()
 
     def stop_after_first_batch(progress: Progress) -> None:
@@ -1603,6 +1933,7 @@ def test_hit_token_limit_survives_a_cancel_and_resume():
         store=store,
         manager=FakeManager(flagged()),
         batch_size=2,
+        order="shortest",
         cancel=cancel,
         progress=stop_after_first_batch,
     )
@@ -1684,7 +2015,7 @@ def test_logs_one_line_at_start_and_end(engine_log):
     start, end = infos
     assert start.startswith(f"Run {result.run_id} started (app): Fake model [demo://fake, none]")
     assert "3 rows, 3 to generate (2 model calls)" in start
-    assert "1 text cut to 1 characters" in start
+    assert start.endswith("1 text cut to 1 characters, longest first.")
     assert end.startswith(f"Run {result.run_id} finished: 3 rows - 3 generated;")
     assert "rows/s" in end
     assert not engine_log.at(logging.WARNING)

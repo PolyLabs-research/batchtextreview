@@ -137,6 +137,7 @@ def test_submit_runs_to_success():
     assert snap.created_at <= snap.started_at <= snap.finished_at
     assert snap.progress.phase == "finished"
     assert snap.progress.fraction == 1.0
+    assert snap.progress.work_fraction == 1.0
     assert job.result is not None
     assert job.result.outputs == ["Q: A", "", "Q: B"]
     assert job.result.complete
@@ -157,7 +158,7 @@ def test_submit_passes_store_and_batch_settings(monkeypatch):
     store = object()
     manager = FakeManager()
     job = JobManager(store, manager).submit(  # type: ignore[arg-type]
-        request(["a"], batch_size=3, max_batch_chars=123)
+        request(["a"], batch_size=3, max_batch_chars=123, order="shortest")
     )
     # The fake store would fail upsert_run, so don't care how the run ends.
     finished(job)
@@ -165,8 +166,32 @@ def test_submit_passes_store_and_batch_settings(monkeypatch):
     assert seen["manager"] is manager
     assert seen["batch_size"] == 3
     assert seen["max_batch_chars"] == 123
+    assert seen["order"] == "shortest"
     assert isinstance(seen["cancel"], threading.Event)
     assert callable(seen["progress"])
+
+
+def test_request_order_defaults_to_the_engine_default():
+    assert request().order == engine.DEFAULT_ORDER == "longest"
+
+
+@pytest.mark.parametrize("order", engine.ORDERS)
+def test_job_runs_in_the_requested_order(order):
+    backend = InstantBackend()
+    job = JobManager(None, FakeManager(backend)).submit(request(["bb", "a", "ccc"], order=order))
+    assert finished(job).state == "succeeded"
+    longest_first = [["Q: ccc"], ["Q: bb"], ["Q: a"]]
+    assert backend.calls == (longest_first if order == "longest" else longest_first[::-1])
+    assert job.result is not None and job.result.outputs == ["Q: BB", "Q: A", "Q: CCC"]
+
+
+def test_unknown_order_fails_the_job():
+    backend = InstantBackend()
+    job = JobManager(None, FakeManager(backend)).submit(request(order="sideways"))
+    snap = finished(job)
+    assert snap.state == "failed" and not snap.has_result
+    assert snap.error is not None and "'longest' or 'shortest'" in snap.error
+    assert backend.calls == []
 
 
 def test_progress_visible_while_running(gated):

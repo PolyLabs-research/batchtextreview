@@ -12,6 +12,7 @@ Run page; it has its own tests.
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -978,3 +979,132 @@ def test_discard_saved_outputs_from_the_run_page(app: AppTest, data_dir: Path) -
     assert resources.get_store().count_outputs(run_id) == 0
     at.run()
     assert at.button(key=run_page.RUN_BUTTON_KEY).label == "Generate 5 rows"
+
+
+# =============================================================================
+# Processing order
+# =============================================================================
+
+
+def test_bar_fraction_measures_work_and_falls_back_to_rows() -> None:
+    from types import SimpleNamespace
+
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.1, work_fraction=0.4)) == 0.4
+    # No work measure (or a broken one): the share of rows done.
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.1)) == 0.1
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.1, work_fraction=None)) == 0.1
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.1, work_fraction=float("nan"))) == 0.1
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.5, work_fraction=1.2)) == 1.0
+    assert run_page.bar_fraction(SimpleNamespace(fraction=-0.5)) == 0.0
+    finished = Progress(phase="finished", total_rows=4, done_rows=4)
+    assert run_page.bar_fraction(finished) == 1.0
+
+
+def test_remembered_order_ignores_unknown_values() -> None:
+    from types import SimpleNamespace
+
+    from batchtextreview import engine
+
+    def store(value):
+        return SimpleNamespace(get_setting=lambda key, default=None: value)
+
+    def broken(key, default=None):
+        raise OSError("database is locked")
+
+    assert run_page.remembered_order(store("shortest")) == "shortest"
+    assert run_page.remembered_order(store("longest")) == "longest"
+    assert run_page.remembered_order(store(None)) == engine.DEFAULT_ORDER
+    assert run_page.remembered_order(store("random")) == engine.DEFAULT_ORDER
+    assert run_page.remembered_order(store(["shortest"])) == engine.DEFAULT_ORDER
+    assert run_page.remembered_order(SimpleNamespace(get_setting=broken)) == engine.DEFAULT_ORDER
+
+
+def _advanced_caption(at: AppTest) -> str:
+    return next(c.value for c in at.caption if c.value.startswith("Up to "))
+
+
+@pytest.mark.ui
+def test_processing_order_control(app: AppTest, data_dir: Path) -> None:
+    from batchtextreview import engine
+
+    at = _load_feedback(app, data_dir)
+    assert not at.exception
+    order = at.segmented_control(key=run_page.ORDER_KEY)
+    assert order.label == "Processing order"
+    assert order.options == ["Longest first", "Shortest first"]
+    assert order.value == engine.DEFAULT_ORDER == "longest"
+    assert order.help == run_page.ORDER_HELP
+    assert "runs out of memory fails in the first batch" in order.help
+    assert _advanced_caption(at) == "Up to 8 output tokens · batch size 8 · longest first"
+
+    order.set_value("shortest").run()
+    assert not at.exception
+    assert _advanced_caption(at) == "Up to 8 output tokens · batch size 8 · shortest first"
+
+
+@pytest.mark.ui
+def test_processing_order_is_remembered(app: AppTest, data_dir: Path) -> None:
+    from batchtextreview.ui import resources
+
+    at = _load_feedback(app, data_dir)
+    at.segmented_control(key=run_page.ORDER_KEY).set_value("shortest").run()
+    assert resources.get_store().get_setting(run_page.ORDER_SETTING) == "shortest"
+    # A later session (another tab, or after restarting the app) starts
+    # from the last choice.
+    later = AppTest.from_file(str(APP), default_timeout=TIMEOUT).run()
+    assert not later.exception
+    assert later.segmented_control(key=run_page.ORDER_KEY).value == "shortest"
+    assert "batch size 8 · shortest first" in _advanced_caption(later)
+    # A stored value that isn't an order (any more) is ignored.
+    resources.get_store().set_setting(run_page.ORDER_SETTING, "random")
+    fresh = AppTest.from_file(str(APP), default_timeout=TIMEOUT).run()
+    assert not fresh.exception
+    assert fresh.segmented_control(key=run_page.ORDER_KEY).value == "longest"
+
+
+@pytest.mark.ui
+def test_processing_order_goes_to_the_job(app: AppTest, data_dir: Path) -> None:
+    at = _load_feedback(app, data_dir)
+    at.button(key=run_page.RUN_BUTTON_KEY).click().run()
+    first = _job_manager().get(at.session_state[state.SESSION_JOBS][0])
+    assert first is not None and first.wait(15)
+    assert first.request.order == "longest"
+    assert first.request.context[state.CONTEXT_KEY].extra["order"] == "longest"
+    at.run()
+    at.run()
+    assert at.button(key=run_page.RUN_BUTTON_KEY).label == "Open results"
+
+    # Another order is another setup (the button no longer opens the run
+    # that just finished), but the same run id: every row is saved.
+    at.segmented_control(key=run_page.ORDER_KEY).set_value("shortest").run()
+    button = at.button(key=run_page.RUN_BUTTON_KEY)
+    assert button.label == "Show saved results"
+    button.click().run()
+    assert not at.exception
+    second = _job_manager().get(at.session_state[state.SESSION_JOBS][0])
+    assert second is not None and second.id != first.id and second.wait(15)
+    assert second.request.order == "shortest"
+    assert second.request.context[state.CONTEXT_KEY].extra["order"] == "shortest"
+    assert second.request.config.run_id == first.request.config.run_id
+
+
+@pytest.mark.ui
+def test_progress_bar_measures_work(
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bar shows the share of the work done (so it moves with the time
+    estimate), while the text beside it still counts rows."""
+    monkeypatch.setattr(Progress, "work_fraction", property(lambda self: 0.37))
+    _use_backend(monkeypatch, delay_s=0.4)
+    job_id = _start_slow_run(app, data_dir)
+    job = _job_manager().get(job_id)
+    assert job is not None
+    deadline = time.monotonic() + 5
+    while job.snapshot().progress.phase != "generating" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    app.run()
+    assert not app.exception
+    bars = app.get("progress")
+    assert len(bars) == 1
+    assert bars[0].proto.value == 37
+    assert re.match(r"\d / 6 rows", bars[0].proto.text)

@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-10-14
+
+### Added
+
+- A processing order setting: **Processing order** under **Advanced** on the Run page (the app
+  remembers your choice), `--order longest` or `--order shortest` for the `run` command, and
+  `order=` for `engine.execute_run` and `jobs.JobRequest`. The Results page's Details tab shows
+  the order a run used, and retrying failed rows or generating the remaining rows keeps it. The
+  order isn't part of the run id, so saved outputs are reused whichever order you pick.
+- `engine.Progress.work_fraction` (with `generation_s` and `work_done`), the share of the work
+  done rather than of rows.
+
+### Changed
+
+- The default order is now longest first (it was shortest first). The time estimate starts high
+  and counts down instead of rising whenever the run reaches longer texts, and a model that runs
+  out of memory fails in the first batch rather than near the end. Choose shortest first to see
+  the first results sooner, or when only the longest texts run out of memory (the out-of-memory
+  error card now says so).
+- The progress bar (and the command line's percentage) measures the work done rather than rows,
+  so a long text counts for more than a short one. It never goes backwards, and the rows of a
+  failed batch retried one at a time count as work still to do.
+- A steadier time estimate: each update moves only part of the way towards the newest
+  calculation, so one unusually fast or slow batch no longer makes it jump.
+
 ## [2.0.0] - 2026-10-12
 
 A ground-up rebuild of the version 1 tool as an installable package, with a new interface, a

@@ -665,12 +665,16 @@ def test_explain_failure_raw_exceptions():
     )
     assert oom.cause == "CUDA out of memory."
     assert "batch size" in oom.action
+    # Longest first, a model that can't fit the longest texts stops the run
+    # before anything is generated (and a retry keeps that order).
+    assert "Processing order set to Shortest first" in oom.action
 
     load_oom = an.explain_failure(
         "Couldn't load Demo (fake outputs): RuntimeError: CUDA out of memory. Tried to allocate",
         "Demo (fake outputs)",
     )
     assert load_oom.loading and "smaller model" in load_oom.action
+    assert "Processing order" not in load_oom.action
 
     gated = an.explain_failure(
         "Couldn't load X: OSError: 401 Client Error. Cannot access gated repo for url https://x"

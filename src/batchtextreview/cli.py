@@ -35,6 +35,10 @@ INPUT                    file to read (any format data.read_table supports)
 --max-new-tokens N       default: the preset's
 --max-input-chars N      default 8000
 --batch-size N           default 8
+--order {longest,shortest}
+                         which texts go first (default longest: the ETA
+                         counts down and an out-of-memory model fails in
+                         the first batch; shortest: first results sooner)
 --limit N                first N rows only (0 = all, default)
 --gold COL               score against this column and log to history
 --output PATH            default: <input stem>_<preset slug>_<model slug>_results.csv
@@ -48,11 +52,12 @@ INPUT                    file to read (any format data.read_table supports)
                          (saved custom presets are still found)
 --results-dir DIR        overrides BTR_RESULTS_DIR
 
-Progress goes to stderr as a single updating line (rows done/total, rate,
-ETA); Ctrl+C cancels cleanly after the current batch, writes the partial
-results, and exits 130. Exit code 1 on validation or load errors (message to
-stderr, no traceback), when no row could be generated and when the results
-had to be saved somewhere other than --output, 0 otherwise.
+Progress goes to stderr as a single updating line (share of the work done,
+rows done/total, rate, ETA); Ctrl+C cancels cleanly after the current
+batch, writes the partial results, and exits 130. Exit code 1 on validation
+or load errors (message to stderr, no traceback), when no row could be
+generated and when the results had to be saved somewhere other than
+--output, 0 otherwise.
 """
 
 from __future__ import annotations
@@ -263,6 +268,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=engine.DEFAULT_BATCH_SIZE,
         metavar="N",
         help=f"rows generated together (default: {engine.DEFAULT_BATCH_SIZE})",
+    )
+    run.add_argument(
+        "--order",
+        choices=engine.ORDERS,
+        default=engine.DEFAULT_ORDER,
+        help=f"which texts go first (default: {engine.DEFAULT_ORDER}) - longest: the ETA counts "
+        "down and a model that runs out of memory fails in the first batch; shortest: the "
+        "first results appear sooner",
     )
     run.add_argument(
         "--limit",
@@ -530,10 +543,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     model_text = spec.label
     if not spec.is_demo:
         model_text += f" ({backend_base.PRECISION_LABELS.get(config.precision, config.precision)})"
-    _err(
+    header = (
         f"{preset.title} | {model_text} | {_count(len(texts), 'row')} of {_source_text(table)}, "
         f"column {_shown(text_col)}"
     )
+    if plan.n_todo_unique:
+        header += f" | {args.order} texts first"
+    _err(header)
     if plan.n_truncated_rows:
         _err(
             f"note: {_count(plan.n_truncated_rows, 'text')} longer than "
@@ -551,6 +567,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 store=store,
                 manager=manager,
                 batch_size=args.batch_size,
+                order=args.order,
                 progress=progress,
                 cancel=cancel,
                 plan=plan,
@@ -1426,8 +1443,10 @@ class ProgressPrinter:
 
     On a terminal: one line, redrawn in place (at most ~10 times a second).
     Otherwise (redirected to a file or a CI log): plain lines - one per
-    phase, then one per 10% of rows (at most one every 2 seconds, so a quick
-    run stays quiet) and at least one every 30 seconds.
+    phase, then one per 10% of the work (at most one every 2 seconds, so a
+    quick run stays quiet) and at least one every 30 seconds. The
+    percentage (and the bar) is ``Progress.work_fraction``: the work done,
+    which weighs a long text more than a short one, not the share of rows.
 
     Never raises: an exception from a progress callback would stop the run.
     """
@@ -1495,7 +1514,7 @@ class ProgressPrinter:
                 self._draw(_progress_text(progress, bar=True))
                 self._last_draw = now
             return
-        fraction = progress.fraction
+        fraction = _work_fraction(progress)
         since = now - self._last_plain
         crossed = fraction >= self._next_step and since >= self._plain_min_gap_s
         if crossed or since >= self._plain_every_s:
@@ -1519,9 +1538,15 @@ class ProgressPrinter:
             self._shown = 0
 
 
+def _work_fraction(progress: engine.Progress) -> float:
+    """``progress.work_fraction``, kept within 0-1."""
+    return min(max(progress.work_fraction, 0.0), 1.0)
+
+
 def _progress_text(progress: engine.Progress, bar: bool) -> str:
     total = progress.total_rows
-    percent = int(progress.fraction * 100)
+    fraction = _work_fraction(progress)
+    percent = int(fraction * 100)
     parts = [f"{progress.done_rows:,}/{total:,} rows"]
     if progress.rows_per_s:
         parts.append(_rate(progress.rows_per_s))
@@ -1530,7 +1555,7 @@ def _progress_text(progress: engine.Progress, bar: bool) -> str:
     if progress.error_rows:
         parts.append(f"{progress.error_rows:,} failed")
     if bar:
-        filled = int(progress.fraction * 20)
+        filled = int(fraction * 20)
         meter = "█" * filled + "░" * (20 - filled)
         return f"Generating {meter} {percent:3d}%  " + " · ".join(parts)
     return f"Generating: {percent}% - " + ", ".join(parts)

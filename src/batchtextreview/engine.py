@@ -13,8 +13,9 @@ template, output length, truncation) hashes to a ``run_id``; each row's
 A batch that fails is retried one prompt at a time, so one poisoned row
 costs only itself rather than the whole batch.
 
-Batch size and row limits are deliberately *not* part of the run id - they
-change speed and scope, not the output for a given text.
+Batch size, processing order (longest or shortest texts first) and row
+limits are deliberately *not* part of the run id - they change speed and
+scope, not the output for a given text.
 """
 
 from __future__ import annotations
@@ -46,6 +47,17 @@ DEFAULT_MAX_INPUT_CHARS = 8000
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_MAX_BATCH_CHARS = 20000
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
+ORDERS: tuple[str, ...] = ("longest", "shortest")
+"""Processing orders for :func:`execute_run`: which texts go to the model
+first. "longest": the time estimate starts high and counts down, and a model
+that runs out of memory fails in the first batch. "shortest": the first
+results appear sooner."""
+DEFAULT_ORDER = "longest"
+ORDER_LABELS: dict[str, str] = {"longest": "Longest first", "shortest": "Shortest first"}
+"""Sentence-case name of each of :data:`ORDERS`, for display."""
+ETA_SMOOTHING = 0.3
+"""Weight of a fresh time-left estimate against the previous one counted
+down (see :class:`_Eta`)."""
 RECENT_LIMIT = 5
 """How many of the latest (text, output) pairs :attr:`Progress.recent` holds."""
 RECENT_TEXT_CHARS = 120
@@ -226,16 +238,44 @@ class Progress:
     """Generation throughput (generated rows / generation seconds)."""
     eta_s: float | None = None
     """Estimated generation seconds left (from the prompts still to send,
-    not the rows), or None before the first successful model call."""
+    not the rows, and smoothed - see :class:`_Eta`), or None before the
+    first successful model call."""
     message: str = ""
     recent: tuple[tuple[str, str], ...] = ()
     """The last few (<= :data:`RECENT_LIMIT`) (text, output) pairs generated
     in this run, newest last - so a broken prompt shows early. The text is
     whitespace-collapsed and at most 120 characters, the output at most 200."""
+    generation_s: float = 0.0
+    """Seconds spent generating so far in this run (model load excluded)."""
+    work_done: float | None = None
+    """Share of the run's work done (0-1), reported as :attr:`work_fraction`;
+    None to work it out from the other fields. :func:`execute_run` fills it
+    in: rows that need no model (blank, cached) count as done from the
+    start, the rest by generation time as in :attr:`work_fraction`, and the
+    figure never goes down within a run (1.0 once a complete run has
+    finished)."""
 
     @property
     def fraction(self) -> float:
+        """Share of the rows done (0-1)."""
         return (self.done_rows / self.total_rows) if self.total_rows else 1.0
+
+    @property
+    def work_fraction(self) -> float:
+        """Share of the work done (0-1), for a progress bar.
+
+        :attr:`work_done` when set. Otherwise, while generating with a time
+        estimate, the generation time so far over that plus the time left
+        (``generation_s / (generation_s + eta_s)``), so a long text weighs
+        more than a short one; else :attr:`fraction` (rows).
+        """
+        if self.work_done is not None:
+            return self.work_done
+        if self.phase == "generating" and self.eta_s is not None:
+            whole = self.generation_s + self.eta_s
+            if whole > 0:
+                return self.generation_s / whole
+        return self.fraction
 
 
 @dataclass
@@ -372,7 +412,8 @@ def pack_batches(
     batch_size: int,
     max_batch_chars: int,
 ) -> list[list[str]]:
-    """Greedy packing of keys (already sorted by length) into batches.
+    """Greedy packing of keys (already sorted by length, longest or
+    shortest first) into batches.
 
     A batch closes when adding the next key would exceed ``batch_size`` rows
     or ``max_batch_chars`` total characters. A single key longer than the
@@ -404,6 +445,7 @@ def execute_run(
     manager: ModelManager,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
+    order: str = DEFAULT_ORDER,
     progress: ProgressCallback | None = None,
     cancel: threading.Event | None = None,
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
@@ -416,10 +458,14 @@ def execute_run(
 
     1. ``plan_run`` (unless ``plan`` is given and its run_id matches).
        Blank rows -> status "blank", output "". Cached keys -> "cached".
-    2. If anything is left: register the run's manifest in the store
-       (``store.upsert_run``), then pending keys are sorted by snippet length
-       (stable: ties keep first-seen order) and packed with
-       :func:`pack_batches`.
+    2. If anything is left, pending keys are sorted by snippet length -
+       ``order`` "longest" (the default) longest first, "shortest" shortest
+       first; stable either way, so ties keep first-seen order - and packed
+       with :func:`pack_batches`. Longest first, the first batch is the
+       heaviest, so a model that runs out of memory fails at once and the
+       time estimate counts down; shortest first, the first results appear
+       sooner. The run's manifest is registered in the store
+       (``store.upsert_run``) with the first saved batch.
     3. The model is obtained lazily via ``manager.acquire(...)`` (a context
        manager that loads/swaps the model and holds the generation lock) only
        if at least one batch must run. A :class:`ModelLoadError` (or any
@@ -460,10 +506,17 @@ def execute_run(
 
     ``rows_per_s`` counts generated rows (duplicates included) per second of
     generation time (excluding model load). ``eta_s`` is estimated from the
-    work left, not from rows: the batches not started yet and their prompt
-    characters, priced by the seconds per call and per character of the
-    calls so far (see :class:`_Eta`). Duplicate rows cost nothing extra,
-    and the longer batches that come last are priced as longer.
+    work left, not from rows: the batches not started yet (and the prompts
+    of a failed batch still to retry alone) and their prompt characters,
+    priced by the seconds per call and per character of the calls so far,
+    and smoothed from one snapshot to the next (see :class:`_Eta`).
+    Duplicate rows cost nothing extra, and batches longer or shorter than
+    those so far are priced as such. ``work_done`` (what
+    :attr:`Progress.work_fraction` reports) measures work rather than rows:
+    the rows that need no model, plus the generation time so far over that
+    time plus ``eta_s`` for the rest; it never goes down within a run, is
+    below 1.0 while any call is still to come, and is 1.0 once a complete
+    run has finished.
 
     Truncation: ``input_truncated`` flags non-blank rows whose text was cut
     to ``max_input_chars``. ``hit_token_limit`` flags generated rows whose
@@ -483,8 +536,11 @@ def execute_run(
     is saved, so a run whose model never loads leaves no empty manifest
     behind. The cancel event is also checked before the model load, so a
     run cancelled while still queued never loads a model. A template
-    without ``{text}`` raises ValueError up front (it is a caller bug, not a
-    model error). ``source`` ("app" or "cli") is recorded with the manifest.
+    without ``{text}``, or an ``order`` not in :data:`ORDERS`, raises
+    ValueError up front (it is a caller bug, not a model error). ``source``
+    ("app" or "cli") is recorded with the manifest. ``order`` is not part of
+    the run id, so a run resumed in the other order reuses every saved
+    output.
 
     If saving a finished batch fails (disk full, locked database), the run
     stops like any other abort: ``aborted_reason`` says what happened, that
@@ -494,14 +550,18 @@ def execute_run(
     """
     if prompting.TEXT not in config.template:
         raise ValueError("The run's template must contain the {text} placeholder.")
+    if order not in ORDERS:
+        allowed = " or ".join(repr(name) for name in ORDERS)
+        raise ValueError(f"Unknown processing order {order!r}: use {allowed}.")
     run = _Run(config, texts, store, progress, source)
     run.prepare(plan)
-    run.log_start()
+    run.log_start(order)
     if run.todo:
         run.generate(
             manager,
             batch_size=batch_size,
             max_batch_chars=max_batch_chars,
+            order=order,
             cancel=cancel,
             max_consecutive_failures=max_consecutive_failures,
         )
@@ -545,6 +605,10 @@ class _Run:
         self.generation_s = 0.0
         self.eta: _Eta | None = None
         """Set once the batches are packed."""
+        self.prompt_chars: dict[str, int] = {}
+        """key -> characters of its prompt, set once the batches are packed."""
+        self.work_done = 0.0
+        """The largest ``Progress.work_done`` reported so far."""
         self.registered = False
         """Whether the run's manifest is in the store yet."""
         self.source = source
@@ -589,7 +653,7 @@ class _Run:
             message = "Everything is already saved - no model needed."
         self._emit("planning", message)
 
-    def log_start(self) -> None:
+    def log_start(self, order: str = DEFAULT_ORDER) -> None:
         config, stats = self.config, self.stats
         details = (
             f"{_count(stats.total, 'row')}, {stats.pending:,} to generate "
@@ -600,6 +664,8 @@ class _Run:
                 f", {_count(stats.truncated_inputs, 'text')} cut to "
                 f"{config.max_input_chars:,} characters"
             )
+        if self.todo:
+            details += f", {ORDER_LABELS.get(order, order).lower()}"
         model_id = config.model_id
         if config.model_revision:
             model_id += f" @ {config.model_revision}"
@@ -619,6 +685,7 @@ class _Run:
         *,
         batch_size: int,
         max_batch_chars: int,
+        order: str,
         cancel: threading.Event | None,
         max_consecutive_failures: int,
     ) -> None:
@@ -627,15 +694,19 @@ class _Run:
         if cancel is not None and cancel.is_set():
             self.cancelled = True
             return
-        # sorted() is stable and self.todo is in first-seen order.
-        ordered = sorted(self.todo, key=lambda k: len(plan.snippets[k]))
+        # sorted() is stable, also with reverse=True (ties keep their order),
+        # and self.todo is in first-seen order.
+        longest_first = order == "longest"
+        ordered = sorted(self.todo, key=lambda k: len(plan.snippets[k]), reverse=longest_first)
         lengths = {k: len(plan.snippets[k]) for k in ordered}
         batches = pack_batches(ordered, lengths, batch_size, max_batch_chars)
-        # Prompt characters per batch (render_prompt is a plain replace).
+        # Prompt characters per key and per batch (render_prompt is a plain
+        # replace); the former also prices a failed batch's single retries.
         n_text = config.template.count(prompting.TEXT)
         overhead = len(config.template) - n_text * len(prompting.TEXT)
-        batch_chars = [sum(overhead + n_text * lengths[k] for k in batch) for batch in batches]
-        eta = self.eta = _Eta(batch_chars)
+        self.prompt_chars = {k: overhead + n_text * lengths[k] for k in ordered}
+        batch_chars = [sum(self.prompt_chars[k] for k in batch) for batch in batches]
+        eta = self.eta = _Eta(batch_chars, longest_first=longest_first)
 
         target = (config.model_id, config.precision)
         already_loaded = _is_loaded(manager, target)
@@ -754,9 +825,18 @@ class _Run:
         """Retry a failed batch one prompt at a time (see execute_run)."""
         succeeded = failed = 0
         same_as_batch = 0
+        eta = self.eta
+        # Its prompts, one call each, are back in the work left (the batch
+        # left it when it started), so the time left doesn't reach 0 - and
+        # the bar 100% - while they are retried.
+        if eta is not None:
+            eta.requeue([self.prompt_chars.get(key, 0) for key in batch])
         for position, key in enumerate(batch):
             if position == 2 and same_as_batch == 2:
                 rest = batch[position:]
+                if eta is not None:
+                    for skipped in rest:
+                        eta.start_batch(self.prompt_chars.get(skipped, 0))
                 log.warning(
                     "Run %s: %s - the first two rows failed on their own with the same "
                     "error, so it isn't a single bad row; %s marked failed without retrying.",
@@ -770,6 +850,8 @@ class _Run:
             if cancel is not None and cancel.is_set():
                 self.cancelled = True
                 break
+            if eta is not None:
+                eta.start_batch(self.prompt_chars.get(key, 0))
             try:
                 raw, flags = self._generate(backend, [key])
                 cleaned = _checked_outputs(raw, 1)
@@ -892,26 +974,49 @@ class _Run:
         if self.progress is None:
             return
         stats = self.stats
+        now = time.perf_counter()
         rate: float | None = None
         if stats.generated:
             rate = stats.generated / max(self.generation_s, 1e-6)
-        eta_s = self.eta.seconds_left() if eta and self.eta is not None else None
+        eta_s = self.eta.report(now) if eta and self.eta is not None else None
+        done_rows = stats.blank + stats.cached + stats.generated + stats.errors
         self.progress(
             Progress(
                 phase=phase,
                 total_rows=stats.total,
-                done_rows=stats.blank + stats.cached + stats.generated + stats.errors,
+                done_rows=done_rows,
                 generated_rows=stats.generated,
                 cached_rows=stats.cached,
                 blank_rows=stats.blank,
                 error_rows=stats.errors,
-                elapsed_s=time.perf_counter() - self.started,
+                elapsed_s=now - self.started,
                 rows_per_s=rate,
                 eta_s=eta_s,
                 message=message,
                 recent=tuple(self.recent),
+                generation_s=self.generation_s,
+                work_done=self._measure_work(phase, eta_s, done_rows),
             )
         )
+
+    def _measure_work(self, phase: Phase, eta_s: float | None, done_rows: int) -> float:
+        """``Progress.work_done`` for a snapshot (see execute_run)."""
+        stats = self.stats
+        total = stats.total
+        complete = not self.cancelled and self.aborted_reason is None and stats.pending == 0
+        if phase == "finished" and complete:
+            work = 1.0
+        elif (
+            total and phase == "generating" and eta_s is not None and self.generation_s + eta_s > 0
+        ):
+            # Rows that needed no model were done before generation started.
+            before = (stats.blank + stats.cached) / total
+            share = self.generation_s / (self.generation_s + eta_s)
+            work = before + (1.0 - before) * share
+        else:
+            work = done_rows / total if total else 1.0
+        self.work_done = max(self.work_done, min(work, 1.0))
+        return self.work_done
 
     def _log_failure(self, what: str, message: str) -> None:
         # A traceback for the first failure only: a run of failing batches
@@ -967,22 +1072,62 @@ class _Eta:
     started yet. Rows never enter it, so a text shared by a thousand
     duplicate rows counts as the one prompt it is.
 
-    Batches run shortest first, so the calls seen so far are cheaper per
-    call and dearer per character than those left: pricing what is left per
-    call and per character brackets the time left, and the fit is clamped
-    to that range. That also steadies it while the lengths seen are too
-    alike to tell ``a`` from ``b`` (then the middle of the range is used).
+    Pricing what is left per call (the mean seconds per call so far) and
+    per character (the seconds per character so far) brackets the time
+    left, in either processing order. Shortest first, the batches left are
+    longer than those seen, so per-call pricing is the low end and
+    per-character pricing the high end; longest first, they are shorter and
+    the roles swap. The fit is clamped to that range (:meth:`seconds_left`),
+    which also steadies it while the lengths seen are too alike to tell
+    ``a`` from ``b``. Then longest first (``longest_first``) takes the high
+    end, per call: no batch left is longer than those so far, so the
+    estimate starts high and only falls once the lengths differ - the
+    middle of the range would start it low wherever decoding dominates
+    (long outputs), as with a run of texts all cut to the max input
+    characters. Shortest first takes the middle of the range, since per
+    character after very short texts can be many times too high.
+
+    The prompts of a failed batch retried one at a time (see
+    :func:`execute_run`) rejoin the work left as one call each
+    (:meth:`requeue`), and each call leaves it as it starts
+    (:meth:`start_batch`) or is marked failed without being retried.
+
+    The estimate reported (:meth:`report`) is smoothed: ``s * fit + (1 - s)
+    * max(0, previous - dt)``, with ``s`` = :data:`ETA_SMOOTHING` and ``dt``
+    the seconds since the previous report. A fit that was right stays right
+    (the previous report counted down is the same number), while a batch
+    that ran unusually fast or slow moves the figure only part of the way.
+    The first report is the fit itself, and once every call has started it
+    is 0.
     """
 
-    def __init__(self, batch_chars: Sequence[int]) -> None:
+    def __init__(
+        self,
+        batch_chars: Sequence[int],
+        smoothing: float = ETA_SMOOTHING,
+        *,
+        longest_first: bool = False,
+    ) -> None:
         self.batches_left = len(batch_chars)
+        """Calls still to start (batches, and prompts to retry alone)."""
         self.chars_left = float(sum(batch_chars))
+        self.smoothing = smoothing
+        self.longest_first = longest_first
         self._n = 0
         self._c = self._cc = self._t = self._ct = 0.0
+        self._reported: float | None = None
+        self._reported_at = 0.0
 
     def start_batch(self, chars: int) -> None:
+        """A call of ``chars`` prompt characters leaves the work left."""
         self.batches_left -= 1
         self.chars_left -= chars
+
+    def requeue(self, prompt_chars: Sequence[int]) -> None:
+        """These prompts (of a batch that failed) will be retried one call
+        each."""
+        self.batches_left += len(prompt_chars)
+        self.chars_left += sum(prompt_chars)
 
     def observe(self, chars: int, seconds: float) -> None:
         self._n += 1
@@ -992,7 +1137,8 @@ class _Eta:
         self._ct += chars * seconds
 
     def seconds_left(self) -> float | None:
-        """None before the first observation; 0 once every batch started."""
+        """The fit, unsmoothed. None before the first observation; 0 once
+        every call started."""
         n = self._n
         if not n:
             return None
@@ -1004,7 +1150,7 @@ class _Eta:
         low, high = min(per_call, per_char), max(per_call, per_char)
         variance = self._cc / n - mean_c * mean_c
         if variance <= 1e-3 * mean_c * mean_c:
-            return math.sqrt(low * high)
+            return high if self.longest_first else math.sqrt(low * high)
         b = (self._ct / n - mean_c * mean_t) / variance
         a = mean_t - b * mean_c
         if b < 0:
@@ -1013,6 +1159,23 @@ class _Eta:
             a, b = 0.0, self._ct / self._cc
         estimate = a * self.batches_left + b * self.chars_left
         return min(max(estimate, low), high)
+
+    def report(self, now: float) -> float | None:
+        """The smoothed estimate at ``now`` (seconds on a clock that only
+        counts up, such as ``time.perf_counter()``). None before the first
+        observation; 0 once every call started."""
+        fit = self.seconds_left()
+        if fit is None:
+            return None
+        if self.batches_left <= 0:
+            estimate = 0.0
+        elif self._reported is None:
+            estimate = fit
+        else:
+            counted_down = max(0.0, self._reported - max(0.0, now - self._reported_at))
+            estimate = self.smoothing * fit + (1.0 - self.smoothing) * counted_down
+        self._reported, self._reported_at = estimate, now
+        return estimate
 
 
 def _is_loaded(manager: Any, target: tuple[str, str]) -> bool:

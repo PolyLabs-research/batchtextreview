@@ -24,6 +24,7 @@ from batchtextreview import engine
 from batchtextreview.engine import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_MAX_BATCH_CHARS,
+    DEFAULT_ORDER,
     Progress,
     RunConfig,
     RunResult,
@@ -49,6 +50,8 @@ class JobRequest:
     texts: list[Any]
     batch_size: int = DEFAULT_BATCH_SIZE
     max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS
+    order: str = DEFAULT_ORDER
+    """Processing order, one of ``engine.ORDERS`` (see ``engine.execute_run``)."""
     context: dict[str, Any] = field(default_factory=dict)
     """Opaque data the UI needs to rebuild the results view later (the
     working DataFrame, column choices, preset key, variable, label set,
@@ -183,11 +186,12 @@ class JobManager:
     def submit(self, request: JobRequest) -> Job:
         """Start a job on a new daemon thread. Raises JobBusyError if one is
         queued/running. The worker calls ``engine.execute_run`` with the
-        job's cancel event and a progress callback that stores the latest
-        Progress. Final state: "cancelled" if the result says cancelled;
-        "failed" if execute_run raised (error = "ExcType: msg", no result) or
-        the result has an aborted_reason (error = that reason; the partial
-        result is still attached); else "succeeded"."""
+        request's batch settings and processing order, the job's cancel
+        event and a progress callback that stores the latest Progress. Final
+        state: "cancelled" if the result says cancelled; "failed" if
+        execute_run raised (error = "ExcType: msg", no result) or the result
+        has an aborted_reason (error = that reason; the partial result is
+        still attached); else "succeeded"."""
         with self._lock:
             if self._active is not None and not self._active.snapshot().done:
                 raise JobBusyError("A run is already in progress.")
@@ -255,6 +259,7 @@ class JobManager:
                 manager=self._manager,
                 batch_size=request.batch_size,
                 max_batch_chars=request.max_batch_chars,
+                order=request.order,
                 progress=job._set_progress,
                 cancel=job._cancel,
             )

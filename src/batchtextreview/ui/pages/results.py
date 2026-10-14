@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Final
 import pandas as pd
 import streamlit as st
 
-from batchtextreview import results
+from batchtextreview import engine, results
 from batchtextreview.labels import INVALID, label_key
 from batchtextreview.prompting import render_prompt
 from batchtextreview.ui import analysis as an
@@ -1876,6 +1876,7 @@ def _details_tab(job: Job, snap: JobSnapshot, built: an.JobAnalysis) -> None:
                 ("Max output tokens", f"{cfg.max_new_tokens:,}"),
                 ("Max input characters", f"{cfg.max_input_chars:,}"),
                 ("Batch size", f"{request.batch_size:,}"),
+                ("Processing order", engine.ORDER_LABELS.get(request.order)),
                 ("Max characters per batch", f"{request.max_batch_chars:,}"),
             ],
         )
