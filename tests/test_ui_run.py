@@ -369,7 +369,11 @@ def test_load_from_folder_and_run(app: AppTest, data_dir: Path) -> None:
     at.button(key=run_page.RUN_BUTTON_KEY).click().run()
     assert "results stub" in _markdown(at)
     assert at.session_state[state.ACTIVE_JOB] == job_id
-    at.run()  # AppTest itself stays on the Run page
+    # Back to the Run page. From Streamlit 1.66, AppTest's next run stays on
+    # the page st.switch_page opened, so open Run explicitly.
+    at._page_hash = _page_hash("run")
+    at.run()
+    assert not at.exception
     assert "results stub" not in _markdown(at)
     # Any change to the setup makes it a new run: saved outputs are reused.
     at.slider(key=run_page.BATCH_KEY).set_value(4).run()
