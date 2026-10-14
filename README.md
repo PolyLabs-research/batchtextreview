@@ -56,41 +56,63 @@ You need Python 3.10 or newer (3.12 is recommended) and, for useful speed, an NV
 
 ### Windows or Linux with an NVIDIA GPU (conda)
 
-You need [Miniforge](https://conda-forge.org/download/), or an Anaconda or Miniconda you already
-have. Run this in a terminal: on Windows, the Miniforge Prompt or Anaconda Prompt.
+You need:
 
-```bash
+- [Git](https://git-scm.com/downloads).
+- [Miniforge](https://conda-forge.org/download/), or an Anaconda or Miniconda you already have.
+- **An NVIDIA driver for CUDA 13.0 or later.** In its top-right corner, `nvidia-smi` must show
+  **CUDA Version: 13.0** or higher (driver 580 or newer). If it shows less, update the driver.
+- **A GeForce GTX 16xx, RTX 20xx or newer card**, or the workstation equivalent. For older
+  cards, see below.
+
+Open a terminal. On Windows, use the Anaconda Prompt or Miniforge Prompt, or a PowerShell window
+whose prompt starts with `(base)`.
+
+**On a company network that inspects HTTPS** (Zscaler and similar), first run these two lines
+once. Otherwise `git clone` fails with "SSL certificate problem: unable to get local issuer
+certificate". See [Corporate networks](#corporate-networks) for what they do. The `git` line is
+for Windows only.
+
+```
+git config --global http.sslBackend schannel
+conda config --set ssl_verify truststore
+```
+
+Then run these one at a time, and stop if one fails. Otherwise a later `pip install` can install
+into the wrong environment.
+
+```
 git clone https://github.com/tripptytrip/batchtextreview.git
 cd batchtextreview
-conda env create -f environment.yml
+conda create -n batchtextreview -c conda-forge --override-channels python=3.12 pip
 conda activate batchtextreview
+pip install torch --index-url https://download.pytorch.org/whl/cu130
 pip install -e ".[llm]"
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 batchtextreview ui
 ```
 
-`conda env create` sets up Python 3.12 and the CUDA build of PyTorch. `pip install` then adds the
-app, with transformers, accelerate and bitsandbytes. The `python -c` line checks that PyTorch can
-see the GPU: it should print a version ending in `+cu130`, then `True`.
+What the steps do:
 
-On a company network, if `git clone` or `conda` fails with a certificate error or "HTTP 429",
-see [Corporate networks](#corporate-networks).
+1. **`conda create`** sets up Python 3.12 from conda-forge only. `--override-channels` keeps conda
+   off Anaconda's own channel, which refuses many company networks ("HTTP 429").
+2. **The first `pip install`** downloads PyTorch's CUDA 13.0 build, a few gigabytes, from
+   download.pytorch.org only. Asked to search PyPI as well, pip takes PyPI's build whenever it is
+   newer, and on Windows that build runs on the CPU only.
+3. **The second `pip install`** adds the app with transformers, accelerate and bitsandbytes. It
+   keeps the PyTorch you just installed.
+4. **The `python -c` line** checks that PyTorch can see the GPU. It should print a version ending
+   in `+cu130`, then `True`.
 
-`environment.yml` installs Python from conda-forge only, and PyTorch from download.pytorch.org
-only. That way pip can't swap in a CPU-only PyTorch from the main package index. The file uses
-the CUDA 13.0 build (`cu130`), which needs:
+**Older card or driver.** You may have a GTX 9xx or 10xx card, or a driver you can't update
+whose `nvidia-smi` shows a CUDA Version from 12.6 to 12.9. Either way, use
+`https://download.pytorch.org/whl/cu126` in the first `pip install` line instead. The check then
+prints `+cu126`. PyTorch has announced that it stops publishing this build
+after version 2.14. Don't go by the [PyTorch selector](https://pytorch.org/get-started/locally/)
+here: it no longer lists the CUDA 13.0 build.
 
-- **A recent driver.** In its top-right corner `nvidia-smi` must show **CUDA Version: 13.0** or
-  higher (driver 580 or newer). If it shows less, update the NVIDIA driver.
-- **A GeForce GTX 16xx or RTX 20xx or newer card**, or the workstation equivalent.
-
-For an older card, or a driver you can't update, open the
-[PyTorch selector](https://pytorch.org/get-started/locally/). Choose Stable, your OS, Pip, and the
-highest CUDA version that `nvidia-smi` allows. Then put the index URL it shows into
-`environment.yml` in place of `https://download.pytorch.org/whl/cu130`.
-
-To update after a `git pull`, run `pip install -e ".[llm]"` again. That picks up any new
-dependencies. `conda env update -f environment.yml` updates PyTorch.
+**Updating.** After a `git pull`, run `pip install -e ".[llm]"` again to pick up any new
+dependencies. To update PyTorch, run the first `pip install` line again with `-U`.
 
 ### CPU only (any OS, no GPU)
 
@@ -513,20 +535,25 @@ stops the tokenizers library from competing with the app's worker thread.
   certificate problem: unable to get local issuer certificate", or with
   `CERTIFICATE_VERIFY_FAILED`. Point each tool at the system store, once:
 
-  ```powershell
-  git config --global http.sslBackend schannel     # git on Windows
-  conda config --set ssl_verify truststore         # conda 23.9 or newer
+  ```
+  git config --global http.sslBackend schannel
+  conda config --set ssl_verify truststore
   ```
 
-  pip 24.2 and newer already uses the system store; the environment from `environment.yml` has a
-  newer pip. With an older pip, add `--use-feature=truststore` to the `pip install` command. The app
-  uses [truststore](https://pypi.org/project/truststore/) at startup, so model downloads work too.
-  Set `BTR_NO_TRUSTSTORE=1` to turn that off.
+  - **The `git` line** is for Git for Windows only. On Linux, git rejects `schannel`.
+  - **The `conda` line** needs conda 23.9 or newer, with Python 3.10 or newer in its base
+    environment. If you also set `HTTPS_PROXY`, it needs conda 26.7 or newer.
+  - **pip** 24.2 and newer already uses the system store on Python 3.10 and newer (through a
+    proxy, from pip 25.2). The environment from [Quick start](#quick-start) gets a newer pip from
+    conda-forge.
+  - **The app** uses [truststore](https://pypi.org/project/truststore/) at startup, so model
+    downloads work too. Set `BTR_NO_TRUSTSTORE=1` to turn that off.
 - **Anaconda's channel refused** ("HTTP 429 Too Many Requests" for repo.anaconda.com, "requires
-  conda client registration"). Anaconda's own channel refuses unregistered company networks.
-  `environment.yml` doesn't use it: its `nodefaults` line keeps conda on conda-forge, even when
-  your conda settings add Anaconda's channel. For your own `conda create` or `conda install`
-  commands, add `-c conda-forge --override-channels`.
+  conda client registration"). Anaconda's own channel refuses unregistered company networks, and
+  nothing here needs it. Add `-c conda-forge --override-channels` to `conda create` and
+  `conda install`, as [Quick start](#quick-start) does. A `nodefaults` line in an environment
+  file doesn't help: conda 26.7 and newer ignore it in `conda env create`
+  ([conda issue #16816](https://github.com/conda/conda/issues/16816)).
 - **Proxy.** If you need an explicit proxy, set `HTTPS_PROXY` (and `HTTP_PROXY`) before
   launching.
 - **Gated models** need a token, from `HF_TOKEN` or `hf auth login` (see [Models](#models)). The
@@ -556,14 +583,15 @@ report a problem.
 
 | Symptom | Fix |
 |---|---|
-| `torch.cuda.is_available()` is `False` | A version ending in `+cpu` means a CPU-only PyTorch. Run `pip uninstall -y torch`, then `pip install torch --index-url https://download.pytorch.org/whl/cu130`, using the index URL from `environment.yml` if you changed it. Then restart the app. A version ending in `+cu…` points to the driver instead: `nvidia-smi` should list the card and show a CUDA Version at least as high as the build's (13.0 for `+cu130`). |
+| `torch.cuda.is_available()` is `False` | A version ending in `+cpu` means a CPU-only PyTorch. Run `pip uninstall -y torch`, then `pip install torch --index-url https://download.pytorch.org/whl/cu130` (or `.../whl/cu126` for an older card, see [Quick start](#quick-start)). Then restart the app. A version ending in `+cu…` points to the driver instead: `nvidia-smi` should list the card and show a CUDA Version at least as high as the build's (13.0 for `+cu130`). |
 | "SSL certificate problem: unable to get local issuer certificate" from `git`, or `CERTIFICATE_VERIFY_FAILED` from conda or pip | Your network inspects HTTPS. See [Corporate networks](#corporate-networks). |
-| `CondaHTTPError: HTTP 429 Too Many Requests` for repo.anaconda.com | Anaconda's channel refuses your network. Use the current `environment.yml`, which avoids that channel, or add `-c conda-forge --override-channels` to your own conda commands. See [Corporate networks](#corporate-networks). |
+| `CondaHTTPError: HTTP 429 Too Many Requests` for repo.anaconda.com | Anaconda's channel refuses your network. Create the environment with the `conda create ... -c conda-forge --override-channels` line from [Quick start](#quick-start), and add `-c conda-forge --override-channels` to your own conda commands. See [Corporate networks](#corporate-networks). |
+| On Linux, `pip install torch --index-url https://download.pytorch.org/whl/cu130` stops with "No matching distribution found" for a dependency | PyPI's Linux PyTorch is itself the CUDA 13.0 build: run `pip install torch` without the index URL. The check still prints `+cu130`. |
 | "4-bit quantisation needs the bitsandbytes package" or a bitsandbytes CUDA error on Windows | `pip install -U bitsandbytes` (it ships Windows wheels). Until that works, set **Weights** to fp16 (`--precision fp16`): models up to about 3B fit an 8 GB card. |
 | "Not enough memory (RAM) to load …" | The weights don't fit in the computer's main memory, which is what a CPU run uses: about 4 bytes per parameter at fp32, so 6 GB for a 1.5B model. Choose a smaller model and close other programs. |
 | CUDA out of memory | The app already halves a batch that runs out of memory and retries. With the default processing order (longest first) this shows in the first batch, and a run whose longest texts don't fit can stop before generating anything: choose **Shortest first** (`--order shortest`) to generate the shorter texts first. If a single row still fails, lower the batch size, lower the max input characters, choose 4-bit, or use a smaller model. Close other programs that use the GPU (check with `nvidia-smi`). Long outputs (PII redaction, 1024 tokens) need the most memory. |
 | 401 / 403 / "gated repo" when loading Llama | Accept the licence on the model's huggingface.co page with the same account as the token, set `HF_TOKEN`, and restart the app. Environment variables are read at launch. |
-| `OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll already initialized` | The app sets `KMP_DUPLICATE_LIB_OK=TRUE` itself. You will only see this error in your own scripts that import torch before `batchtextreview`. Set the variable there, or use the conda environment from `environment.yml`, which avoids the clash. |
+| `OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll already initialized` | The app sets `KMP_DUPLICATE_LIB_OK=TRUE` itself. You will only see this error in your own scripts that import torch before `batchtextreview`. Set the variable there, or use the conda environment from [Quick start](#quick-start), which avoids the clash. |
 | "does not recognize this architecture" | The model is newer than your `transformers`. Run `pip install -U transformers`. |
 | The first run sits on "Loading…" for minutes | The model is being downloaded, and later runs load from disk. Set `HF_HOME` to move the cache to a larger disk. |
 | Every label is `[invalid]` | The model is answering in sentences. Raise the max output tokens slightly, make the prompt stricter ("Reply with one word only"), or try a larger model. Open a row on the Results page to see the full output. |
@@ -574,7 +602,6 @@ report a problem.
 
 ```
 app.py                            Streamlit entry point
-environment.yml                   conda environment: Python and CUDA PyTorch
 examples/sample_feedback.csv      gold-labelled sample data
 docs/MIGRATING.md                 upgrading from version 1
 docs/screenshot.png               the screenshot above

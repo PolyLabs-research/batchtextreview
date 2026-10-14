@@ -6,16 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Removed
+
+- `environment.yml`. The README's NVIDIA GPU install now uses three commands that work with every
+  conda version:
+  - `conda create -n batchtextreview -c conda-forge --override-channels python=3.12 pip`
+  - `pip install torch --index-url https://download.pytorch.org/whl/cu130`
+  - `pip install -e ".[llm]"`
+
+  `environment.yml` also installed the `dev` tools. For development, use
+  `pip install -e ".[llm,dev]"`.
+
 ### Fixed
 
-- Installing with an NVIDIA GPU. `environment.yml` could install a CPU-only PyTorch on Windows,
-  because pip took a newer CPU build from PyPI over the CUDA build. It now takes PyTorch from
-  download.pytorch.org only, and uses the CUDA 13.0 build. The app is installed in a second step,
-  `pip install -e ".[llm]"`.
-- `conda env create -f environment.yml` failed on networks that Anaconda's channel refuses (HTTP
-  429), because conda added that channel from the user's settings. The file now excludes it.
-- The README explains the certificate errors that git, conda and pip give on networks with TLS
-  inspection, and how to fix each one.
+- **CPU-only PyTorch on Windows.** The GPU install could install a CPU-only PyTorch on Windows.
+  It searched both PyPI and the CUDA 12.8 index, whose newest torch was older than PyPI's, so pip
+  took PyPI's build. That build is CPU-only on Windows. PyTorch now comes from the CUDA 13.0 index
+  alone. For GTX 9xx and 10xx cards, use the `cu126` index instead.
+- **HTTP 429 from Anaconda's channel.** The install failed on networks that Anaconda's channel
+  refuses, because conda added that channel from the user's settings. `--override-channels` keeps
+  conda on conda-forge. A `nodefaults` line in the environment file would not have been enough:
+  conda 26.7 and newer ignore it in `conda env create` (conda issue #16816).
+- **Certificate errors.** The README now lists the certificate errors that git, conda and pip give
+  on networks with TLS inspection. It gives the one-off fix for each, to run before `git clone`.
 
 ## [2.1.0] - 2026-10-14
 
