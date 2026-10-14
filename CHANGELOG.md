@@ -8,8 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Removed
 
-- `environment.yml`. The README's NVIDIA GPU install now uses three commands that work with every
-  conda version:
+- `environment.yml`. The README's NVIDIA GPU install now uses three commands instead:
   - `conda create -n batchtextreview -c conda-forge --override-channels python=3.12 pip`
   - `pip install torch --index-url https://download.pytorch.org/whl/cu130`
   - `pip install -e ".[llm]"`

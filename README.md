@@ -61,7 +61,8 @@ You need:
 - [Git](https://git-scm.com/downloads).
 - [Miniforge](https://conda-forge.org/download/), or an Anaconda or Miniconda you already have.
 - **An NVIDIA driver for CUDA 13.0 or later.** In its top-right corner, `nvidia-smi` must show
-  **CUDA Version: 13.0** or higher (driver 580 or newer). If it shows less, update the driver.
+  **CUDA Version: 13.0** or higher (driver 580 or newer). If it shows less, update the driver,
+  or see **Older card or driver** below.
 - **A GeForce GTX 16xx, RTX 20xx or newer card**, or the workstation equivalent. For older
   cards, see below.
 
@@ -102,14 +103,15 @@ What the steps do:
 3. **The second `pip install`** adds the app with transformers, accelerate and bitsandbytes. It
    keeps the PyTorch you just installed.
 4. **The `python -c` line** checks that PyTorch can see the GPU. It should print a version ending
-   in `+cu130`, then `True`.
+   in `+cu130`, then `True`. If it doesn't, see [Troubleshooting](#troubleshooting).
 
-**Older card or driver.** You may have a GTX 9xx or 10xx card, or a driver you can't update
-whose `nvidia-smi` shows a CUDA Version from 12.6 to 12.9. Either way, use
+**Older card or driver.** You may have a GTX 9xx or 10xx card, or a GTX 16xx to RTX 40xx card
+with a driver you can't update whose `nvidia-smi` shows a CUDA Version from 12.6 to 12.9. An
+RTX 50xx card needs driver 580 or newer. Otherwise, use
 `https://download.pytorch.org/whl/cu126` in the first `pip install` line instead. The check then
-prints `+cu126`. PyTorch has announced that it stops publishing this build
-after version 2.14. Don't go by the [PyTorch selector](https://pytorch.org/get-started/locally/)
-here: it no longer lists the CUDA 13.0 build.
+prints `+cu126`. PyTorch has announced that it stops publishing this build after version 2.14.
+Don't go by the [PyTorch selector](https://pytorch.org/get-started/locally/) here: it no longer
+lists the CUDA 13.0 build.
 
 **Updating.** After a `git pull`, run `pip install -e ".[llm]"` again to pick up any new
 dependencies. To update PyTorch, run the first `pip install` line again with `-U`.
@@ -544,8 +546,8 @@ stops the tokenizers library from competing with the app's worker thread.
   - **The `conda` line** needs conda 23.9 or newer, with Python 3.10 or newer in its base
     environment. If you also set `HTTPS_PROXY`, it needs conda 26.7 or newer.
   - **pip** 24.2 and newer already uses the system store on Python 3.10 and newer (through a
-    proxy, from pip 25.2). The environment from [Quick start](#quick-start) gets a newer pip from
-    conda-forge.
+    proxy, from pip 25.2). The conda environment from [Quick start](#quick-start) gets a newer
+    pip from conda-forge.
   - **The app** uses [truststore](https://pypi.org/project/truststore/) at startup, so model
     downloads work too. Set `BTR_NO_TRUSTSTORE=1` to turn that off.
 - **Anaconda's channel refused** ("HTTP 429 Too Many Requests" for repo.anaconda.com, "requires
