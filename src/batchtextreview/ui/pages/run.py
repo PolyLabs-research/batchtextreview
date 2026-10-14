@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import math
 import os
 import re
 import traceback
@@ -78,6 +79,7 @@ CATEGORY_KEY = "run.category"
 MODEL_KEY = "run.model"
 CUSTOM_MODEL_KEY = "run.custom_model"
 BATCH_KEY = "run.batch_size"
+ORDER_KEY = "run.order"
 PRECISION_KEY = "run.precision"
 MAX_CHARS_KEY = "run.max_input_chars"
 PRESET_NAME_KEY = "run.preset_name"
@@ -114,6 +116,12 @@ _FORMAT_NAMES = {
 _ENCODING_NAMES = data.ENCODING_LABELS
 _DELIMITER_NAMES = {",": "comma", ";": "semicolon", "\t": "tab", "|": "pipe"}
 _EXCEL_SUFFIXES = (".xlsx", ".xlsm")
+ORDER_SETTING = "run_order"
+"""Store setting holding the processing order chosen last (any session)."""
+ORDER_HELP = (
+    "Longest first: the time estimate starts high and counts down, and a model that runs "
+    "out of memory fails in the first batch. Shortest first: the first results appear sooner."
+)
 
 
 # =============================================================================
@@ -184,6 +192,8 @@ class _PlanSettings:
     batch_size: int
     precision: str
     max_input_chars: int
+    order: str
+    """Processing order: one of ``engine.ORDERS``."""
 
 
 _NO_TABLE = "Load a table first (step 1)."
@@ -1358,6 +1368,9 @@ def _plan_settings(
     _init(PRECISION_KEY, "auto")
     _ensure_option(PRECISION_KEY, list(_PRECISION_CHOICES), "auto")
     _init(MAX_CHARS_KEY, engine.DEFAULT_MAX_INPUT_CHARS)
+    if ORDER_KEY not in st.session_state:  # read the store once per session
+        st.session_state[ORDER_KEY] = remembered_order(store)
+    _ensure_option(ORDER_KEY, list(engine.ORDERS), engine.DEFAULT_ORDER)
     is_demo = spec is not None and spec.is_demo
     auto_resolves = PRECISION_LABELS[resolve_precision("auto", device)]
 
@@ -1391,6 +1404,19 @@ def _plan_settings(
                     "automatically.",
                     persist_state="session",
                 )
+            )
+            order = (
+                st.segmented_control(
+                    "Processing order",
+                    list(engine.ORDERS),
+                    format_func=engine.ORDER_LABELS.__getitem__,
+                    key=ORDER_KEY,
+                    required=True,
+                    help=ORDER_HELP,
+                    on_change=_remember_order,
+                    persist_state="session",
+                )
+                or engine.DEFAULT_ORDER
             )
             precision = (
                 st.segmented_control(
@@ -1440,8 +1466,8 @@ def _plan_settings(
         if precision == "auto" and not is_demo:
             precision_note += f" ({fmt.precision(resolve_precision('auto', device))})"
         st.caption(
-            f"Up to {fmt.plural(max_tokens, 'output token')} · batch size {batch_size}"
-            + precision_note
+            f"Up to {fmt.plural(max_tokens, 'output token')} · batch size {batch_size} · "
+            f"{engine.ORDER_LABELS[order].lower()}" + precision_note
         )
 
     chosen = _PlanSettings(
@@ -1451,8 +1477,26 @@ def _plan_settings(
         batch_size=batch_size,
         precision=precision,
         max_input_chars=max_chars,
+        order=order,
     )
     return chosen, selection
+
+
+def remembered_order(store: Store) -> str:
+    """The processing order chosen last (in any session), or
+    ``engine.DEFAULT_ORDER`` when none was chosen or the stored value isn't
+    one of ``engine.ORDERS`` (any more)."""
+    stored = _safe(lambda: store.get_setting(ORDER_SETTING), None)
+    return stored if stored in engine.ORDERS else engine.DEFAULT_ORDER
+
+
+def _remember_order() -> None:
+    """Make the processing order just chosen the default of later sessions."""
+    order = st.session_state.get(ORDER_KEY)
+    if order in engine.ORDERS:
+        # Remembering the choice is a convenience only.
+        with contextlib.suppress(Exception):
+            resources.get_store().set_setting(ORDER_SETTING, order)
 
 
 # =============================================================================
@@ -1496,6 +1540,7 @@ def _setup_signature(
         tuple(task.labels or ()),
         plan_settings.max_new_tokens,
         plan_settings.batch_size,
+        plan_settings.order,
         plan_settings.precision,
         plan_settings.max_input_chars,
         data_step.ds.fingerprint if data_step.ds else None,
@@ -1808,6 +1853,7 @@ def _submit(
         extra={
             "exact_match": bool(exact and not task.labels and data_step.gold_col),
             "batch_size": plan_settings.batch_size,
+            "order": plan_settings.order,
             "precision_requested": plan_settings.precision,
             "data_source": data_step.ds.origin,
             "suggested_max_new_tokens": task.preset.max_new_tokens,
@@ -1817,6 +1863,7 @@ def _submit(
         config=config,
         texts=texts,
         batch_size=plan_settings.batch_size,
+        order=plan_settings.order,
         context={state.CONTEXT_KEY: context},
         # Logs the evaluation even if nobody is on the Results page when the
         # run ends - the only place it is logged (analysis.history_entry).
@@ -1889,7 +1936,7 @@ def _progress_panel(job_id: str) -> None:
     loading_s = None
     if p.phase == "loading" and snap.started_at is not None:
         loading_s = (datetime.now(snap.started_at.tzinfo) - snap.started_at).total_seconds()
-    status.progress(min(max(p.fraction, 0.0), 1.0), text=progress_text(p, loading_s))
+    status.progress(bar_fraction(p), text=progress_text(p, loading_s))
     if p.blank_rows:  # so the counts below add up to the rows done
         status.caption(
             f"Includes {fmt.plural(p.blank_rows, 'blank row')}, skipped without a model call."
@@ -1933,6 +1980,18 @@ def _first_download_gb(model_id: str) -> int | None:
     if resources.downloaded(spec.repo) is not False or resources.offline_mode():
         return None
     return resources.download_size_gb(spec.params_b)
+
+
+def bar_fraction(p: engine.Progress) -> float:
+    """How full the progress bar is, 0-1: the share of the work done
+    (``Progress.work_fraction``, measured in generation time rather than
+    rows, and never going back), so the bar moves with the time left
+    whichever order the texts run in - the text beside it counts rows.
+    Falls back to the share of rows done (``Progress.fraction``)."""
+    value = getattr(p, "work_fraction", None)
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        value = p.fraction
+    return min(max(float(value), 0.0), 1.0)
 
 
 def progress_text(p: engine.Progress, loading_s: float | None = None) -> str:

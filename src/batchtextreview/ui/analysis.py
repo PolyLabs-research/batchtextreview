@@ -933,7 +933,9 @@ def _hint(kind: str | None, loading: bool) -> str | None:
             )
         return (
             "The GPU ran out of memory. Lower the batch size or Max input characters under "
-            "Advanced on the Run page, or pick a smaller model."
+            "Advanced on the Run page, or pick a smaller model. With Processing order set to "
+            "Shortest first (also under Advanced), the shorter texts are generated before any "
+            "long ones fail."
         )
     if kind == "access":
         return (

@@ -20,7 +20,8 @@ locally on an NVIDIA GPU, Apple silicon, or the CPU.
   configuration is instant, an interrupted run picks up where it stopped, and only failed rows are
   retried.
 - **Runs in the background** with live progress, rows per second, time remaining and a Cancel
-  button. Results stay on screen when you click around.
+  button. The longest texts go first by default, so the time estimate counts down and a model
+  that runs out of memory fails at once. Results stay on screen when you click around.
 - **Evaluation built in:** accuracy, macro-F1, Cohen's kappa, a clickable confusion matrix,
   per-class precision and recall, and accuracy by slice (for example by difficulty tier).
 - **History.** Every scored run lands in a leaderboard, so you can compare models and prompts on
@@ -161,14 +162,19 @@ The app has four pages: **Run**, **Results**, **History** and **Models & setting
 4. **Pick a model and plan the run** (Run plan card). Choose a model, or **Custom model…** for any
    Hugging Face repo id or local folder. Then choose the rows (**All**, **First rows** or
    **Random sample**, the sample drawn with a fixed seed so it is repeatable) and the number of
-   rows. **Advanced** holds the max output tokens, batch size, **Weights** (Auto, 4-bit, fp16 or
-   fp32: the precision the model is loaded in) and the max input characters per row. The plan
-   shows how many rows are selected, how many already have saved outputs, and how many still need
-   the model. When some are saved, **Discard saved outputs** deletes them for this configuration.
+   rows. **Advanced** holds the max output tokens, batch size, **Processing order**, **Weights**
+   (Auto, 4-bit, fp16 or fp32: the precision the model is loaded in) and the max input characters
+   per row. *Longest first* (the default order) starts with the longest texts, so the time
+   estimate starts high and counts down, and a model that runs out of memory fails in the first
+   batch rather than near the end. *Shortest first* shows the first results sooner. The app
+   remembers your choice. The plan shows how many rows are selected, how many already have saved
+   outputs, and how many still need the model. When some are saved, **Discard saved outputs**
+   deletes them for this configuration.
 5. **Run.** The button reads **Generate N rows**, or **Show saved results** when everything is
    already saved, and shows its keyboard shortcut. The run continues in the background while you
    use the other pages, and you can cancel it at any time. Everything generated before you cancel
-   is kept.
+   is kept. The progress bar measures the work done rather than rows, so a long text counts for
+   more than a short one, and the time left is smoothed so one slow batch doesn't make it jump.
 6. **Results → Outputs.** The input table plus `OUTPUT`, `LABEL`, `CORRECT` and `STATUS`
    columns, `ERROR` when something failed, and `NOTE` when a text was cut to the max input
    characters or an output reached the max output tokens ("output may be cut off"). You can filter
@@ -278,7 +284,8 @@ Within a run id, each row is looked up by a hash of its (truncated) text. As a r
 
 These things do **not** create a new run id, so saved outputs are reused:
 
-- batch size;
+- batch size and processing order (longest or shortest texts first), which change speed, not
+  outputs;
 - which rows you select (All / First rows / Random sample), and their order;
 - the file name or format, other columns, and the name of the text column (only the text itself
   counts);
@@ -332,10 +339,10 @@ label.
 
 ## Command line
 
-The same engine is available without the browser. Progress is shown on one updating line (rows,
-rate, time remaining). Ctrl+C stops cleanly after the current batch and writes the partial
-results. The examples below break long commands with `\`. In PowerShell, end the lines with a
-backtick (`` ` ``) instead, or put the whole command on one line.
+The same engine is available without the browser. Progress is shown on one updating line (the
+share of the work done, rows, rate, time remaining). Ctrl+C stops cleanly after the current batch
+and writes the partial results. The examples below break long commands with `\`. In PowerShell,
+end the lines with a backtick (`` ` ``) instead, or put the whole command on one line.
 
 ```bash
 # Score a sentiment run on the sample data and log it to History
@@ -379,6 +386,7 @@ batchtextreview import-legacy "C:\old\results" # import version-1 results (docs/
 | `--max-new-tokens N` | preset's | Max output tokens. |
 | `--max-input-chars N` | 8000 | Truncate longer texts. |
 | `--batch-size N` | 8 | Rows generated together. |
+| `--order` | `longest` | Which texts go first: `longest` (the time estimate counts down, and a model that runs out of memory fails in the first batch) or `shortest` (the first results appear sooner). Saved outputs are reused either way. |
 | `--limit N` | 0 (all) | Only the first N rows. |
 | `--gold COL` | | Score against this column and log to History. |
 | `--output PATH` | `<input>_<preset>_<model>_results.csv` | Results file, by default next to the input (lower-case names, so runs of different models don't replace each other). `.xlsx` writes Excel. Given a folder, the default name is used inside it. An existing file is replaced, with a note. JSON presets get one column per key. |
@@ -438,7 +446,9 @@ Path("sentiment_results.csv").write_bytes(results.to_csv_bytes(frame))  # UTF-8 
 
 `execute_run` never raises for a model that fails to load or a batch that fails: check
 `result.aborted_reason` and the rows whose status is `error`. Pass `store=None` to neither read
-nor save outputs. Keep one `ModelManager` for the whole session, so the model loads only once.
+nor save outputs, and `order="shortest"` to start with the shortest texts (the default,
+`"longest"`, starts with the longest). Keep one `ModelManager` for the whole session, so the model
+loads only once.
 
 ## Configuration
 
@@ -518,7 +528,7 @@ report a problem.
 | `torch.cuda.is_available()` is `False`, and on Windows the version has no `+cu128` | pip installed a CPU-only PyTorch. Run `pip uninstall -y torch`, then `pip install torch --index-url https://download.pytorch.org/whl/cu128`. Also check that `nvidia-smi` works, since an outdated driver also causes this. |
 | "4-bit quantisation needs the bitsandbytes package" or a bitsandbytes CUDA error on Windows | `pip install -U bitsandbytes` (it ships Windows wheels). Until that works, set **Weights** to fp16 (`--precision fp16`): models up to about 3B fit an 8 GB card. |
 | "Not enough memory (RAM) to load …" | The weights don't fit in the computer's main memory, which is what a CPU run uses: about 4 bytes per parameter at fp32, so 6 GB for a 1.5B model. Choose a smaller model and close other programs. |
-| CUDA out of memory | The app already halves a batch that runs out of memory and retries. If a single row still fails, lower the batch size, lower the max input characters, choose 4-bit, or use a smaller model. Close other programs that use the GPU (check with `nvidia-smi`). Long outputs (PII redaction, 1024 tokens) need the most memory. |
+| CUDA out of memory | The app already halves a batch that runs out of memory and retries. With the default processing order (longest first) this shows in the first batch, and a run whose longest texts don't fit can stop before generating anything: choose **Shortest first** (`--order shortest`) to generate the shorter texts first. If a single row still fails, lower the batch size, lower the max input characters, choose 4-bit, or use a smaller model. Close other programs that use the GPU (check with `nvidia-smi`). Long outputs (PII redaction, 1024 tokens) need the most memory. |
 | 401 / 403 / "gated repo" when loading Llama | Accept the licence on the model's huggingface.co page with the same account as the token, set `HF_TOKEN`, and restart the app. Environment variables are read at launch. |
 | `OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll already initialized` | The app sets `KMP_DUPLICATE_LIB_OK=TRUE` itself. You will only see this error in your own scripts that import torch before `batchtextreview`. Set the variable there, or use the conda environment from `environment.yml`, which avoids the clash. |
 | "does not recognize this architecture" | The model is newer than your `transformers`. Run `pip install -U transformers`. |

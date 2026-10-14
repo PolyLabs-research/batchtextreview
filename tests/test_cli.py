@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -603,6 +604,52 @@ def test_run_aborts_after_repeated_batch_failures(capsys, small_file, results, m
     assert "Stopped early" in out
 
 
+@pytest.mark.parametrize("order", [None, "longest", "shortest"])
+def test_run_order_sets_which_texts_go_first(capsys, small_file, results, monkeypatch, order):
+    backend = FakeBackend()
+    monkeypatch.setattr(cli, "default_factory", lambda m, p: backend)
+    seen = {}
+    real = engine.execute_run
+
+    def spy(config, texts, **kwargs):
+        seen.update(kwargs)
+        return real(config, texts, **kwargs)
+
+    monkeypatch.setattr(engine, "execute_run", spy)
+    extra = ["--order", order] if order else []
+    code, _out, err = demo_run(
+        capsys, small_file, results, "--preset", "Sentiment", "--batch-size", "1", *extra
+    )
+    assert code == 0, err
+    expected = order or "longest"
+    assert seen["order"] == expected
+    texts = [t for t in pd.read_csv(small_file, dtype=str)["TEXT"].dropna()]
+    first = (max if expected == "longest" else min)(texts, key=len)
+    assert first in backend.calls[0][0]
+    [header] = [line for line in err.splitlines() if line.startswith("Sentiment | ")]
+    assert header.endswith(f"column TEXT | {expected} texts first")
+
+    # The order isn't part of the run id: the other order is served from the cache.
+    other = "shortest" if expected == "longest" else "longest"
+    code, out, err = demo_run(
+        capsys, small_file, results, "--preset", "Sentiment", "--order", other
+    )
+    assert code == 0, err
+    assert "from cache" in out and "generated" not in out.split("\n", 1)[0]
+    [header] = [line for line in err.splitlines() if line.startswith("Sentiment | ")]
+    assert "texts first" not in header  # nothing to generate, so no order to tell
+
+
+def test_run_order_rejects_other_values(capsys, small_file):
+    with pytest.raises(SystemExit) as raised:
+        cli.main(
+            ["run", str(small_file), "--model", DEMO, "--preset", "Sentiment", "--order", "random"]
+        )
+    assert raised.value.code == 2
+    err = capsys.readouterr().err
+    assert "--order" in err and "'longest'" in err and "'shortest'" in err
+
+
 # --------------------------------------------------------------------------
 # run: friendly errors (exit 1, one message, no traceback)
 # --------------------------------------------------------------------------
@@ -845,7 +892,16 @@ def test_progress_plain_lines_are_occasional():
     printer(progress("loading", 0, message="Loading Demo..."))
     for done in range(1, 101):
         clock.now += 0.5
-        printer(progress("generating", done, generated_rows=done, rows_per_s=2.0, eta_s=1.0))
+        printer(
+            progress(
+                "generating",
+                done,
+                generated_rows=done,
+                rows_per_s=2.0,
+                generation_s=done * 0.5,
+                eta_s=(100 - done) * 0.5,
+            )
+        )
     printer(progress("finished", 100, message="Finished."))
     printer.close()
     text = stream.getvalue()
@@ -856,6 +912,28 @@ def test_progress_plain_lines_are_occasional():
     # One line per 10% at most: 50 s of progress, never more than 10 lines.
     assert 5 <= len(generating) <= 10
     assert "2.0 rows/s" in generating[0]
+
+
+def test_progress_percentage_measures_work_not_rows():
+    # Longest first: 10 rows of 100 done, but 90 s of the 120 s of work.
+    p = progress("generating", 10, eta_s=30.0, generation_s=90.0)
+    assert p.fraction == 0.1
+    assert cli._progress_text(p, bar=False) == "Generating: 75% - 10/100 rows, ETA 30s"
+    bar = cli._progress_text(p, bar=True)
+    assert bar.startswith("Generating " + "█" * 15 + "░" * 5 + "  75%  10/100 rows")
+    # The engine's own figure wins; without an estimate, rows.
+    assert "50%" in cli._progress_text(dataclasses.replace(p, work_done=0.5), bar=False)
+    assert "10%" in cli._progress_text(dataclasses.replace(p, eta_s=None), bar=False)
+    assert "100%" in cli._progress_text(dataclasses.replace(p, work_done=1.5), bar=False)
+
+
+def test_progress_plain_lines_follow_the_work_done():
+    stream = io.StringIO()
+    clock = FakeClock()
+    printer = cli.ProgressPrinter(stream, interactive=False, clock=clock)
+    clock.now += 5
+    printer(progress("generating", 2, generation_s=50.0, eta_s=50.0))  # 2% of rows
+    assert stream.getvalue() == "Generating: 50% - 2/100 rows, ETA 50s\n"
 
 
 def test_progress_quick_run_stays_quiet():
@@ -1371,9 +1449,10 @@ def test_run_help_lists_options(capsys):
     for option in (
         "--text-column", "--preset", "--template", "--template-file", "--var", "--labels",
         "--model", "--precision", "--max-new-tokens", "--max-input-chars", "--batch-size",
-        "--limit", "--gold", "--output", "--no-cache", "--results-dir",
+        "--order", "--limit", "--gold", "--output", "--no-cache", "--results-dir",
     ):  # fmt: skip
         assert option in out
+    assert "{longest,shortest}" in out
 
 
 def test_precision_help_matches_what_auto_resolves_to(capsys):

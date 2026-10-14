@@ -12,7 +12,10 @@ Run page; it has its own tests.
 
 from __future__ import annotations
 
+import re
+import threading
 import time
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -368,7 +371,11 @@ def test_load_from_folder_and_run(app: AppTest, data_dir: Path) -> None:
     at.button(key=run_page.RUN_BUTTON_KEY).click().run()
     assert "results stub" in _markdown(at)
     assert at.session_state[state.ACTIVE_JOB] == job_id
-    at.run()  # AppTest itself stays on the Run page
+    # Back to the Run page. From Streamlit 1.66, AppTest's next run stays on
+    # the page st.switch_page opened, so open Run explicitly.
+    at._page_hash = _page_hash("run")
+    at.run()
+    assert not at.exception
     assert "results stub" not in _markdown(at)
     # Any change to the setup makes it a new run: saved outputs are reused.
     at.slider(key=run_page.BATCH_KEY).set_value(4).run()
@@ -529,12 +536,34 @@ def test_custom_model_needs_a_value(app: AppTest, data_dir: Path) -> None:
 # ---- running, finishing and failing runs -------------------------------------
 
 
-def _use_backend(monkeypatch: pytest.MonkeyPatch, **fake_kwargs) -> None:
-    """Serve the demo model from a FakeBackend with ``fake_kwargs`` (e.g. a
-    per-batch delay, or a load failure via ``load_error``)."""
-    from batchtextreview.backends import manager as manager_module
-    from batchtextreview.backends.fake import FakeBackend
+@pytest.fixture
+def hold(app: AppTest) -> Iterator[threading.Event]:
+    """Pass to ``_use_backend(..., hold=hold)``: every model call then waits
+    until the test sets it, so the page can be checked mid-run however slow
+    the AppTest runs are (a sleep-paced run can end before a slow run even
+    draws it). Set at teardown too, before ``app`` waits for the jobs."""
+    event = threading.Event()
+    yield event
+    event.set()
 
+
+def _use_backend(
+    monkeypatch: pytest.MonkeyPatch, hold: threading.Event | None = None, **fake_kwargs
+) -> None:
+    """Serve the demo model from a FakeBackend with ``fake_kwargs`` (e.g. a
+    per-batch delay, or a load failure via ``load_error``); with ``hold``,
+    each model call first waits for that event (see the ``hold`` fixture)."""
+    from batchtextreview.backends import manager as manager_module
+    from batchtextreview.backends.fake import FakeBackend, demo_responder
+
+    if hold is not None:
+        respond = fake_kwargs.pop("responder", demo_responder)
+
+        def held(prompt: str) -> str:
+            hold.wait(TIMEOUT)
+            return respond(prompt)
+
+        fake_kwargs["responder"] = held
     load_error = fake_kwargs.pop("load_error", None)
 
     def factory(model_id: str, precision: str) -> FakeBackend:
@@ -556,9 +585,9 @@ def _start_slow_run(at: AppTest, data_dir: Path) -> str:
 
 @pytest.mark.ui
 def test_progress_panel_and_cancel(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
-    _use_backend(monkeypatch, delay_s=0.4)
+    _use_backend(monkeypatch, hold=hold)
     job_id = _start_slow_run(app, data_dir)
     job = _job_manager().get(job_id)
     assert job is not None and not job.snapshot().done
@@ -580,9 +609,10 @@ def test_progress_panel_and_cancel(
 
     cancel.click().run()
     assert not app.exception
+    hold.set()  # batch 1 ends only now: the cancel always lands before batch 2
     assert job.wait(15)
     assert job.snapshot().state == "cancelled"
-    app.run()  # notices the end: a toast, and the page stays on Run
+    app.run()  # the first run to see the end: a toast, and the page stays on Run
     assert not app.exception
     assert any(
         t.value.startswith("Run cancelled after") and t.value.endswith("in the Last run card.")
@@ -596,13 +626,15 @@ def test_progress_panel_and_cancel(
 
 @pytest.mark.ui
 def test_editing_during_a_run_keeps_the_user_on_the_run_page(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
     """Someone preparing the next run while one finishes isn't pulled away."""
-    _use_backend(monkeypatch, delay_s=0.2)
+    _use_backend(monkeypatch, hold=hold)
     job_id = _start_slow_run(app, data_dir)
     assert "Changes here apply to your next run." in _markdown(app)
     app.slider(key=run_page.BATCH_KEY).set_value(2).run()  # an edit mid-run
+    assert not app.exception
+    hold.set()
     job = _job_manager().get(job_id)
     assert job is not None and job.wait(15) and job.snapshot().state == "succeeded"
     app.run()
@@ -614,16 +646,17 @@ def test_editing_during_a_run_keeps_the_user_on_the_run_page(
 
 @pytest.mark.ui
 def test_run_finishing_on_another_page_toasts_without_switching(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
     from batchtextreview.ui.pages import history as history_page
 
     monkeypatch.setattr(history_page, "render", lambda: st.write("history stub"))
-    _use_backend(monkeypatch, delay_s=0.2)
+    _use_backend(monkeypatch, hold=hold)
     job_id = _start_slow_run(app, data_dir)
     app._page_hash = _page_hash("history")
     app.run()
     assert "history stub" in _markdown(app)
+    hold.set()
     job = _job_manager().get(job_id)
     assert job is not None and job.wait(15)
 
@@ -720,17 +753,18 @@ def _path_to(at: AppTest, key: str) -> tuple[int, ...] | None:
 
 @pytest.mark.ui
 def test_prompt_editor_keeps_its_place_when_a_run_ends(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
     """When a run ends the page reruns: if anything above the prompt editor
     appeared or vanished, the browser would rebuild it and lose text still
     being typed. And the page never switches away by itself."""
-    _use_backend(monkeypatch, delay_s=0.2)
+    _use_backend(monkeypatch, hold=hold)
     job_id = _start_slow_run(app, data_dir)
     assert "Changes here apply to your next run." in _markdown(app)
     during = _path_to(app, "tmpl::Sentiment")
     model_during = _path_to(app, run_page.MODEL_KEY)
     assert during is not None and model_during is not None
+    hold.set()
     job = _job_manager().get(job_id)
     assert job is not None and job.wait(15)
     app.run()
@@ -978,3 +1012,132 @@ def test_discard_saved_outputs_from_the_run_page(app: AppTest, data_dir: Path) -
     assert resources.get_store().count_outputs(run_id) == 0
     at.run()
     assert at.button(key=run_page.RUN_BUTTON_KEY).label == "Generate 5 rows"
+
+
+# =============================================================================
+# Processing order
+# =============================================================================
+
+
+def test_bar_fraction_measures_work_and_falls_back_to_rows() -> None:
+    from types import SimpleNamespace
+
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.1, work_fraction=0.4)) == 0.4
+    # No work measure (or a broken one): the share of rows done.
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.1)) == 0.1
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.1, work_fraction=None)) == 0.1
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.1, work_fraction=float("nan"))) == 0.1
+    assert run_page.bar_fraction(SimpleNamespace(fraction=0.5, work_fraction=1.2)) == 1.0
+    assert run_page.bar_fraction(SimpleNamespace(fraction=-0.5)) == 0.0
+    finished = Progress(phase="finished", total_rows=4, done_rows=4)
+    assert run_page.bar_fraction(finished) == 1.0
+
+
+def test_remembered_order_ignores_unknown_values() -> None:
+    from types import SimpleNamespace
+
+    from batchtextreview import engine
+
+    def store(value):
+        return SimpleNamespace(get_setting=lambda key, default=None: value)
+
+    def broken(key, default=None):
+        raise OSError("database is locked")
+
+    assert run_page.remembered_order(store("shortest")) == "shortest"
+    assert run_page.remembered_order(store("longest")) == "longest"
+    assert run_page.remembered_order(store(None)) == engine.DEFAULT_ORDER
+    assert run_page.remembered_order(store("random")) == engine.DEFAULT_ORDER
+    assert run_page.remembered_order(store(["shortest"])) == engine.DEFAULT_ORDER
+    assert run_page.remembered_order(SimpleNamespace(get_setting=broken)) == engine.DEFAULT_ORDER
+
+
+def _advanced_caption(at: AppTest) -> str:
+    return next(c.value for c in at.caption if c.value.startswith("Up to "))
+
+
+@pytest.mark.ui
+def test_processing_order_control(app: AppTest, data_dir: Path) -> None:
+    from batchtextreview import engine
+
+    at = _load_feedback(app, data_dir)
+    assert not at.exception
+    order = at.segmented_control(key=run_page.ORDER_KEY)
+    assert order.label == "Processing order"
+    assert order.options == ["Longest first", "Shortest first"]
+    assert order.value == engine.DEFAULT_ORDER == "longest"
+    assert order.help == run_page.ORDER_HELP
+    assert "runs out of memory fails in the first batch" in order.help
+    assert _advanced_caption(at) == "Up to 8 output tokens · batch size 8 · longest first"
+
+    order.set_value("shortest").run()
+    assert not at.exception
+    assert _advanced_caption(at) == "Up to 8 output tokens · batch size 8 · shortest first"
+
+
+@pytest.mark.ui
+def test_processing_order_is_remembered(app: AppTest, data_dir: Path) -> None:
+    from batchtextreview.ui import resources
+
+    at = _load_feedback(app, data_dir)
+    at.segmented_control(key=run_page.ORDER_KEY).set_value("shortest").run()
+    assert resources.get_store().get_setting(run_page.ORDER_SETTING) == "shortest"
+    # A later session (another tab, or after restarting the app) starts
+    # from the last choice.
+    later = AppTest.from_file(str(APP), default_timeout=TIMEOUT).run()
+    assert not later.exception
+    assert later.segmented_control(key=run_page.ORDER_KEY).value == "shortest"
+    assert "batch size 8 · shortest first" in _advanced_caption(later)
+    # A stored value that isn't an order (any more) is ignored.
+    resources.get_store().set_setting(run_page.ORDER_SETTING, "random")
+    fresh = AppTest.from_file(str(APP), default_timeout=TIMEOUT).run()
+    assert not fresh.exception
+    assert fresh.segmented_control(key=run_page.ORDER_KEY).value == "longest"
+
+
+@pytest.mark.ui
+def test_processing_order_goes_to_the_job(app: AppTest, data_dir: Path) -> None:
+    at = _load_feedback(app, data_dir)
+    at.button(key=run_page.RUN_BUTTON_KEY).click().run()
+    first = _job_manager().get(at.session_state[state.SESSION_JOBS][0])
+    assert first is not None and first.wait(15)
+    assert first.request.order == "longest"
+    assert first.request.context[state.CONTEXT_KEY].extra["order"] == "longest"
+    at.run()
+    at.run()
+    assert at.button(key=run_page.RUN_BUTTON_KEY).label == "Open results"
+
+    # Another order is another setup (the button no longer opens the run
+    # that just finished), but the same run id: every row is saved.
+    at.segmented_control(key=run_page.ORDER_KEY).set_value("shortest").run()
+    button = at.button(key=run_page.RUN_BUTTON_KEY)
+    assert button.label == "Show saved results"
+    button.click().run()
+    assert not at.exception
+    second = _job_manager().get(at.session_state[state.SESSION_JOBS][0])
+    assert second is not None and second.id != first.id and second.wait(15)
+    assert second.request.order == "shortest"
+    assert second.request.context[state.CONTEXT_KEY].extra["order"] == "shortest"
+    assert second.request.config.run_id == first.request.config.run_id
+
+
+@pytest.mark.ui
+def test_progress_bar_measures_work(
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
+) -> None:
+    """The bar shows the share of the work done (so it moves with the time
+    estimate), while the text beside it still counts rows."""
+    monkeypatch.setattr(Progress, "work_fraction", property(lambda self: 0.37))
+    _use_backend(monkeypatch, hold=hold)  # the run stays in batch 1 throughout
+    job_id = _start_slow_run(app, data_dir)
+    job = _job_manager().get(job_id)
+    assert job is not None
+    deadline = time.monotonic() + 5
+    while job.snapshot().progress.phase != "generating" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    app.run()
+    assert not app.exception
+    bars = app.get("progress")
+    assert len(bars) == 1
+    assert bars[0].proto.value == 37
+    assert re.match(r"\d / 6 rows", bars[0].proto.text)

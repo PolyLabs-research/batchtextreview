@@ -97,8 +97,11 @@ def make_context(frame: pd.DataFrame, preset: presets.Preset, **overrides: Any) 
     return state.RunContext(**values)
 
 
-def submit(frame: pd.DataFrame, preset_key: str = "Sentiment", **overrides: Any):
-    """Run the demo model over ``frame`` like the Run page does; wait for it."""
+def submit(
+    frame: pd.DataFrame, preset_key: str = "Sentiment", order: str | None = None, **overrides: Any
+):
+    """Run the demo model over ``frame`` like the Run page does; wait for it.
+    ``order``: the processing order (the request's default when None)."""
     preset = presets.get_preset(preset_key)
     assert preset is not None
     ctx = make_context(frame, preset, **overrides)
@@ -111,6 +114,7 @@ def submit(frame: pd.DataFrame, preset_key: str = "Sentiment", **overrides: Any)
             batch_size=4,
             context={state.CONTEXT_KEY: ctx},
             on_finish=analysis.finish_hook(resources.get_store()),
+            **({"order": order} if order is not None else {}),
         )
     )
     assert job.wait(TIMEOUT), "demo job did not finish"
@@ -244,6 +248,18 @@ def test_details_tab(frame):
     assert "{text}" in texts(at, "code")
     assert [s.value for s in at.subheader][:4] == ["Run", "Rows", "Model", "Data"]
     assert "Not generated" in texts(at)
+    assert "Processing order" in texts(at)
+    assert "Longest first" in texts(at)  # the default
+
+
+def test_details_tab_shows_the_processing_order(frame):
+    job = submit(frame, order="shortest", extra={"order": "shortest"})
+    at = open_results([job.id], **{"results.tabs": "Details"})
+    no_exceptions(at)
+    lines = texts(at).splitlines()
+    at_label = lines.index(":gray[Processing order]")
+    assert lines[at_label + 1] == "Shortest first"
+    assert "Longest first" not in texts(at)
 
 
 def test_open_ended_run_is_not_scored(frame):
@@ -485,6 +501,46 @@ def test_row_errors_card_and_retry(frame, monkeypatch):
     assert at.session_state[state.ACTIVE_JOB] == new_job.id
     assert new_job.request.texts == job.request.texts
     new_job.wait(TIMEOUT)
+
+
+def test_retry_keeps_the_processing_order(frame, monkeypatch):
+    """Retrying failed rows (or generating the remaining ones) sends them in
+    the order the original run used, whatever the Run page is set to now."""
+    from batchtextreview.backends.fake import FakeBackend
+    from batchtextreview.backends.manager import ModelManager
+    from batchtextreview.jobs import JobManager
+
+    def factory(model_id, precision):
+        return FakeBackend(
+            model_id, precision, fail_when=lambda batch: any("refund" in p for p in batch)
+        )
+
+    manager = JobManager(resources.get_store(), ModelManager(factory=factory), history=5)
+    monkeypatch.setattr(resources, "get_job_manager", lambda: manager)
+    preset = presets.get_preset("Sentiment")
+    job = manager.submit(
+        _request(
+            config=RunConfig.build(models.DEMO_MODEL, preset.template, preset.max_new_tokens),
+            texts=frame["TEXT"].tolist(),
+            batch_size=1,
+            order="shortest",
+            context={state.CONTEXT_KEY: make_context(frame, preset, extra={"order": "shortest"})},
+        )
+    )
+    assert job.wait(TIMEOUT)
+    at = open_results([job.id], **{"run.order": "longest"})
+    no_exceptions(at)
+    next(b for b in at.button if b.label == "Retry 1 failed row").click().run()
+    no_exceptions(at)
+    retry = manager.latest()
+    assert retry is not None and retry.id != job.id
+    assert retry.request.order == "shortest"
+    assert retry.request.context[state.CONTEXT_KEY].extra["order"] == "shortest"
+    assert retry.wait(TIMEOUT)
+    at.session_state["results.tabs"] = "Details"
+    at.run()
+    no_exceptions(at)
+    assert "Shortest first" in texts(at)
 
 
 # ---- review fixes ----------------------------------------------------------------
@@ -828,10 +884,13 @@ def test_a_retried_run_does_not_overwrite_the_retry_in_history(frame):
     )
 
 
-def test_retry_follows_the_new_run_here_with_the_same_setup(frame, monkeypatch):
+@pytest.mark.parametrize("ends_mid_render", [False, True], ids=["normal", "ends-mid-render"])
+def test_retry_follows_the_new_run_here_with_the_same_setup(frame, monkeypatch, ends_mid_render):
     """A retry stays on the Results page (its running card shows progress)
     and carries the original's Run-page setup, so the Run page knows it ran
-    exactly the same thing."""
+    exactly the same thing. ``ends_mid_render``: the retry finishes just
+    after the page has listed the runs, so the list doesn't have it yet -
+    the page must still follow it, not fall back to the original."""
     from batchtextreview.backends.fake import FakeBackend
     from batchtextreview.backends.manager import ModelManager
     from batchtextreview.jobs import JobManager
@@ -861,6 +920,17 @@ def test_retry_follows_the_new_run_here_with_the_same_setup(frame, monkeypatch):
     setup = ("some", "setup")
     at = open_results([job.id], **{state.JOB_SETUPS: {job.id: setup}})
     no_exceptions(at)
+    if ends_mid_render:
+        list_jobs = results_page._selectable_jobs
+
+        def list_then_finish(jobs_manager):
+            listed = list_jobs(jobs_manager)
+            running = jobs_manager.active()
+            if running is not None:
+                running.wait(TIMEOUT)
+            return listed
+
+        monkeypatch.setattr(results_page, "_selectable_jobs", list_then_finish)
     gate["open"] = True
     next(b for b in at.button if b.label == "Retry 1 failed row").click().run()
     no_exceptions(at)

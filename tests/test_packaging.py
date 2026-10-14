@@ -483,6 +483,7 @@ _UI_LABELS = (
     "Random sample",
     "Advanced",
     "Weights",
+    "Processing order",
     "Discard saved outputs",
     "Show saved results",
     "Export",
