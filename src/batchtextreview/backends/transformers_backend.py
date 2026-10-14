@@ -500,8 +500,7 @@ def _import_stack() -> tuple[Any, Any]:
     except Exception as exc:
         raise ModelLoadError(
             f"PyTorch could not be imported ({type(exc).__name__}: {exc}).",
-            hint="Install torch for your CUDA version from https://pytorch.org, then "
-            "pip install transformers accelerate.",
+            hint='Install PyTorch and the "llm" extra as README.md describes for your machine.',
         ) from exc
     try:
         import transformers
