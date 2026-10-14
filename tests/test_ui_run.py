@@ -587,12 +587,16 @@ def test_progress_panel_and_cancel(
     assert not app.exception
     assert job.wait(15)
     assert job.snapshot().state == "cancelled"
-    app.run()  # notices the end: a toast, and the page stays on Run
-    assert not app.exception
+    # The end is noticed once, with a toast - in the click's rerun when the
+    # batch being cancelled ended during it, else on the next run.
+    toasts = [t.value for t in app.toast]
+    if not any(t.startswith("Run cancelled after") for t in toasts):
+        app.run()
+        assert not app.exception
+        toasts = [t.value for t in app.toast]
     assert any(
-        t.value.startswith("Run cancelled after") and t.value.endswith("in the Last run card.")
-        for t in app.toast
-    )
+        t.startswith("Run cancelled after") and t.endswith("in the Last run card.") for t in toasts
+    ), toasts
     # People cancel to change something here: no switch to Results.
     assert "results stub" not in _markdown(app)
     assert "Cancelled" in _markdown(app)  # last-run card
