@@ -13,7 +13,9 @@ Run page; it has its own tests.
 from __future__ import annotations
 
 import re
+import threading
 import time
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -534,12 +536,34 @@ def test_custom_model_needs_a_value(app: AppTest, data_dir: Path) -> None:
 # ---- running, finishing and failing runs -------------------------------------
 
 
-def _use_backend(monkeypatch: pytest.MonkeyPatch, **fake_kwargs) -> None:
-    """Serve the demo model from a FakeBackend with ``fake_kwargs`` (e.g. a
-    per-batch delay, or a load failure via ``load_error``)."""
-    from batchtextreview.backends import manager as manager_module
-    from batchtextreview.backends.fake import FakeBackend
+@pytest.fixture
+def hold(app: AppTest) -> Iterator[threading.Event]:
+    """Pass to ``_use_backend(..., hold=hold)``: every model call then waits
+    until the test sets it, so the page can be checked mid-run however slow
+    the AppTest runs are (a sleep-paced run can end before a slow run even
+    draws it). Set at teardown too, before ``app`` waits for the jobs."""
+    event = threading.Event()
+    yield event
+    event.set()
 
+
+def _use_backend(
+    monkeypatch: pytest.MonkeyPatch, hold: threading.Event | None = None, **fake_kwargs
+) -> None:
+    """Serve the demo model from a FakeBackend with ``fake_kwargs`` (e.g. a
+    per-batch delay, or a load failure via ``load_error``); with ``hold``,
+    each model call first waits for that event (see the ``hold`` fixture)."""
+    from batchtextreview.backends import manager as manager_module
+    from batchtextreview.backends.fake import FakeBackend, demo_responder
+
+    if hold is not None:
+        respond = fake_kwargs.pop("responder", demo_responder)
+
+        def held(prompt: str) -> str:
+            hold.wait(TIMEOUT)
+            return respond(prompt)
+
+        fake_kwargs["responder"] = held
     load_error = fake_kwargs.pop("load_error", None)
 
     def factory(model_id: str, precision: str) -> FakeBackend:
@@ -561,9 +585,9 @@ def _start_slow_run(at: AppTest, data_dir: Path) -> str:
 
 @pytest.mark.ui
 def test_progress_panel_and_cancel(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
-    _use_backend(monkeypatch, delay_s=0.4)
+    _use_backend(monkeypatch, hold=hold)
     job_id = _start_slow_run(app, data_dir)
     job = _job_manager().get(job_id)
     assert job is not None and not job.snapshot().done
@@ -585,18 +609,15 @@ def test_progress_panel_and_cancel(
 
     cancel.click().run()
     assert not app.exception
+    hold.set()  # batch 1 ends only now: the cancel always lands before batch 2
     assert job.wait(15)
     assert job.snapshot().state == "cancelled"
-    # The end is noticed once, with a toast - in the click's rerun when the
-    # batch being cancelled ended during it, else on the next run.
-    toasts = [t.value for t in app.toast]
-    if not any(t.startswith("Run cancelled after") for t in toasts):
-        app.run()
-        assert not app.exception
-        toasts = [t.value for t in app.toast]
+    app.run()  # the first run to see the end: a toast, and the page stays on Run
+    assert not app.exception
     assert any(
-        t.startswith("Run cancelled after") and t.endswith("in the Last run card.") for t in toasts
-    ), toasts
+        t.value.startswith("Run cancelled after") and t.value.endswith("in the Last run card.")
+        for t in app.toast
+    )
     # People cancel to change something here: no switch to Results.
     assert "results stub" not in _markdown(app)
     assert "Cancelled" in _markdown(app)  # last-run card
@@ -605,13 +626,15 @@ def test_progress_panel_and_cancel(
 
 @pytest.mark.ui
 def test_editing_during_a_run_keeps_the_user_on_the_run_page(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
     """Someone preparing the next run while one finishes isn't pulled away."""
-    _use_backend(monkeypatch, delay_s=0.2)
+    _use_backend(monkeypatch, hold=hold)
     job_id = _start_slow_run(app, data_dir)
     assert "Changes here apply to your next run." in _markdown(app)
     app.slider(key=run_page.BATCH_KEY).set_value(2).run()  # an edit mid-run
+    assert not app.exception
+    hold.set()
     job = _job_manager().get(job_id)
     assert job is not None and job.wait(15) and job.snapshot().state == "succeeded"
     app.run()
@@ -623,16 +646,17 @@ def test_editing_during_a_run_keeps_the_user_on_the_run_page(
 
 @pytest.mark.ui
 def test_run_finishing_on_another_page_toasts_without_switching(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
     from batchtextreview.ui.pages import history as history_page
 
     monkeypatch.setattr(history_page, "render", lambda: st.write("history stub"))
-    _use_backend(monkeypatch, delay_s=0.2)
+    _use_backend(monkeypatch, hold=hold)
     job_id = _start_slow_run(app, data_dir)
     app._page_hash = _page_hash("history")
     app.run()
     assert "history stub" in _markdown(app)
+    hold.set()
     job = _job_manager().get(job_id)
     assert job is not None and job.wait(15)
 
@@ -729,17 +753,18 @@ def _path_to(at: AppTest, key: str) -> tuple[int, ...] | None:
 
 @pytest.mark.ui
 def test_prompt_editor_keeps_its_place_when_a_run_ends(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
     """When a run ends the page reruns: if anything above the prompt editor
     appeared or vanished, the browser would rebuild it and lose text still
     being typed. And the page never switches away by itself."""
-    _use_backend(monkeypatch, delay_s=0.2)
+    _use_backend(monkeypatch, hold=hold)
     job_id = _start_slow_run(app, data_dir)
     assert "Changes here apply to your next run." in _markdown(app)
     during = _path_to(app, "tmpl::Sentiment")
     model_during = _path_to(app, run_page.MODEL_KEY)
     assert during is not None and model_during is not None
+    hold.set()
     job = _job_manager().get(job_id)
     assert job is not None and job.wait(15)
     app.run()
@@ -1098,12 +1123,12 @@ def test_processing_order_goes_to_the_job(app: AppTest, data_dir: Path) -> None:
 
 @pytest.mark.ui
 def test_progress_bar_measures_work(
-    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, hold: threading.Event
 ) -> None:
     """The bar shows the share of the work done (so it moves with the time
     estimate), while the text beside it still counts rows."""
     monkeypatch.setattr(Progress, "work_fraction", property(lambda self: 0.37))
-    _use_backend(monkeypatch, delay_s=0.4)
+    _use_backend(monkeypatch, hold=hold)  # the run stays in batch 1 throughout
     job_id = _start_slow_run(app, data_dir)
     job = _job_manager().get(job_id)
     assert job is not None
