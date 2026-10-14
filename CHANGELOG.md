@@ -29,6 +29,11 @@ All notable changes to this project are documented here. The format follows
 - A steadier time estimate: each update moves only part of the way towards the newest
   calculation, so one unusually fast or slow batch no longer makes it jump.
 
+### Fixed
+
+- After **Retry failed rows** on the Results page, a retry that finished almost at once could
+  leave the page on the original run instead of opening the retry.
+
 ## [2.0.0] - 2026-10-12
 
 A ground-up rebuild of the version 1 tool as an installable package, with a new interface, a

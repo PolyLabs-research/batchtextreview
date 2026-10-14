@@ -884,10 +884,13 @@ def test_a_retried_run_does_not_overwrite_the_retry_in_history(frame):
     )
 
 
-def test_retry_follows_the_new_run_here_with_the_same_setup(frame, monkeypatch):
+@pytest.mark.parametrize("ends_mid_render", [False, True], ids=["normal", "ends-mid-render"])
+def test_retry_follows_the_new_run_here_with_the_same_setup(frame, monkeypatch, ends_mid_render):
     """A retry stays on the Results page (its running card shows progress)
     and carries the original's Run-page setup, so the Run page knows it ran
-    exactly the same thing."""
+    exactly the same thing. ``ends_mid_render``: the retry finishes just
+    after the page has listed the runs, so the list doesn't have it yet -
+    the page must still follow it, not fall back to the original."""
     from batchtextreview.backends.fake import FakeBackend
     from batchtextreview.backends.manager import ModelManager
     from batchtextreview.jobs import JobManager
@@ -917,6 +920,17 @@ def test_retry_follows_the_new_run_here_with_the_same_setup(frame, monkeypatch):
     setup = ("some", "setup")
     at = open_results([job.id], **{state.JOB_SETUPS: {job.id: setup}})
     no_exceptions(at)
+    if ends_mid_render:
+        list_jobs = results_page._selectable_jobs
+
+        def list_then_finish(jobs_manager):
+            listed = list_jobs(jobs_manager)
+            running = jobs_manager.active()
+            if running is not None:
+                running.wait(TIMEOUT)
+            return listed
+
+        monkeypatch.setattr(results_page, "_selectable_jobs", list_then_finish)
     gate["open"] = True
     next(b for b in at.button if b.label == "Retry 1 failed row").click().run()
     no_exceptions(at)

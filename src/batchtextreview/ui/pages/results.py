@@ -79,6 +79,9 @@ _TOP_CONFUSIONS_OVER = 12
 def render() -> None:
     components.page_header("Results", "Browse, score and export what a run produced.")
     manager = resources.get_job_manager()
+    # Asked before listing: a run that ends between the two is missing from
+    # the list yet no longer running, and must still be the one followed.
+    pending = _is_running(st.session_state.get(state.ACTIVE_JOB))
     jobs = _selectable_jobs(manager)
     if not jobs:
         _empty_page(manager)
@@ -91,7 +94,7 @@ def render() -> None:
         if running is not None:
             _running_notice(running.id)
 
-    job = _current_job(jobs)
+    job = _current_job(jobs, pending)
     _forget_other_drawer(job.id)
     snap = job.snapshot()
     built = an.get_analysis(job) if job.result is not None else None
@@ -207,10 +210,11 @@ def _run_labels(jobs: list[Job]) -> dict[str, str]:
     return labels
 
 
-def _current_job(jobs: list[Job]) -> Job:
+def _current_job(jobs: list[Job], pending: bool) -> Job:
     """The run to show: ACTIVE_JOB when it is selectable, else the run
     selector's last choice, else the newest. Syncs the selector's state (the
-    widget itself is drawn in the header row by :func:`_run_picker`)."""
+    widget itself is drawn in the header row by :func:`_run_picker`).
+    ``pending``: ACTIVE_JOB was still running when ``jobs`` was listed."""
     by_id = {job.id: job for job in jobs}
     ids = list(by_id)
     wanted = st.session_state.get(state.ACTIVE_JOB)
@@ -220,10 +224,9 @@ def _current_job(jobs: list[Job]) -> Job:
         st.session_state[_K_SELECT] = ids[0]
     chosen = st.session_state[_K_SELECT]
     # ACTIVE_JOB may name a run still in progress (e.g. after a retry): leave
-    # it alone so that run is shown as soon as it finishes.
-    if st.session_state.get(state.ACTIVE_JOB) not in by_id and not _is_running(
-        st.session_state.get(state.ACTIVE_JOB)
-    ):
+    # it alone so that run is shown as soon as it finishes (the context
+    # strip's poller reruns the app then).
+    if st.session_state.get(state.ACTIVE_JOB) not in by_id and not pending:
         st.session_state[state.ACTIVE_JOB] = chosen
     return by_id[chosen]
 
