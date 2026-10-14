@@ -56,24 +56,41 @@ You need Python 3.10 or newer (3.12 is recommended) and, for useful speed, an NV
 
 ### Windows or Linux with an NVIDIA GPU (conda)
 
-Install [Miniforge](https://conda-forge.org/download/) or Miniconda, then run this in a terminal
-(on Windows, the Miniforge or Anaconda Prompt):
+You need [Miniforge](https://conda-forge.org/download/), or an Anaconda or Miniconda you already
+have. Run this in a terminal: on Windows, the Miniforge Prompt or Anaconda Prompt.
 
 ```bash
 git clone https://github.com/tripptytrip/batchtextreview.git
 cd batchtextreview
 conda env create -f environment.yml
 conda activate batchtextreview
-
-# Check that PyTorch can see the GPU: expect "... True"
+pip install -e ".[llm]"
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-
 batchtextreview ui
 ```
 
-`environment.yml` installs Python 3.12, the CUDA 12.8 build of PyTorch from download.pytorch.org,
-and this project with its `llm` and `dev` extras. CUDA 12.8 suits GeForce RTX 20xx to 50xx cards.
-For an older card (GTX 10xx), change the index URL in the file to `.../whl/cu126`.
+`conda env create` sets up Python 3.12 and the CUDA build of PyTorch. `pip install` then adds the
+app, with transformers, accelerate and bitsandbytes. The `python -c` line checks that PyTorch can
+see the GPU: it should print a version ending in `+cu130`, then `True`.
+
+On a company network, if `git clone` or `conda` fails with a certificate error or "HTTP 429",
+see [Corporate networks](#corporate-networks).
+
+`environment.yml` installs Python from conda-forge only, and PyTorch from download.pytorch.org
+only. That way pip can't swap in a CPU-only PyTorch from the main package index. The file uses
+the CUDA 13.0 build (`cu130`), which needs:
+
+- **A recent driver.** In its top-right corner `nvidia-smi` must show **CUDA Version: 13.0** or
+  higher (driver 580 or newer). If it shows less, update the NVIDIA driver.
+- **A GeForce GTX 16xx or RTX 20xx or newer card**, or the workstation equivalent.
+
+For an older card, or a driver you can't update, open the
+[PyTorch selector](https://pytorch.org/get-started/locally/). Choose Stable, your OS, Pip, and the
+highest CUDA version that `nvidia-smi` allows. Then put the index URL it shows into
+`environment.yml` in place of `https://download.pytorch.org/whl/cu130`.
+
+To update after a `git pull`, run `pip install -e ".[llm]"` again. That picks up any new
+dependencies. `conda env update -f environment.yml` updates PyTorch.
 
 ### CPU only (any OS, no GPU)
 
@@ -490,12 +507,26 @@ stops the tokenizers library from competing with the app's worker thread.
 
 ## Corporate networks
 
-- **TLS inspection (Zscaler and similar).** At startup the app uses
-  [truststore](https://pypi.org/project/truststore/), so Python validates HTTPS against the
-  operating system's certificate store. That store already trusts your company's inspection
-  certificate, which means model downloads work without copying certificate bundles around. Set
-  `BTR_NO_TRUSTSTORE=1` to turn this off. Recent pip (24.2 and later) already uses the system
-  store. For conda, run `conda config --set ssl_verify truststore`.
+- **TLS inspection (Zscaler and similar).** Some company networks decrypt and re-sign HTTPS
+  traffic with their own certificate. The operating system's certificate store trusts that
+  certificate, but tools that carry their own certificate list don't. They fail with "SSL
+  certificate problem: unable to get local issuer certificate", or with
+  `CERTIFICATE_VERIFY_FAILED`. Point each tool at the system store, once:
+
+  ```powershell
+  git config --global http.sslBackend schannel     # git on Windows
+  conda config --set ssl_verify truststore         # conda 23.9 or newer
+  ```
+
+  pip 24.2 and newer already uses the system store; the environment from `environment.yml` has a
+  newer pip. With an older pip, add `--use-feature=truststore` to the `pip install` command. The app
+  uses [truststore](https://pypi.org/project/truststore/) at startup, so model downloads work too.
+  Set `BTR_NO_TRUSTSTORE=1` to turn that off.
+- **Anaconda's channel refused** ("HTTP 429 Too Many Requests" for repo.anaconda.com, "requires
+  conda client registration"). Anaconda's own channel refuses unregistered company networks.
+  `environment.yml` doesn't use it: its `nodefaults` line keeps conda on conda-forge, even when
+  your conda settings add Anaconda's channel. For your own `conda create` or `conda install`
+  commands, add `-c conda-forge --override-channels`.
 - **Proxy.** If you need an explicit proxy, set `HTTPS_PROXY` (and `HTTP_PROXY`) before
   launching.
 - **Gated models** need a token, from `HF_TOKEN` or `hf auth login` (see [Models](#models)). The
@@ -525,7 +556,9 @@ report a problem.
 
 | Symptom | Fix |
 |---|---|
-| `torch.cuda.is_available()` is `False`, and on Windows the version has no `+cu128` | pip installed a CPU-only PyTorch. Run `pip uninstall -y torch`, then `pip install torch --index-url https://download.pytorch.org/whl/cu128`. Also check that `nvidia-smi` works, since an outdated driver also causes this. |
+| `torch.cuda.is_available()` is `False` | A version ending in `+cpu` means a CPU-only PyTorch. Run `pip uninstall -y torch`, then `pip install torch --index-url https://download.pytorch.org/whl/cu130`, using the index URL from `environment.yml` if you changed it. Then restart the app. A version ending in `+cu…` points to the driver instead: `nvidia-smi` should list the card and show a CUDA Version at least as high as the build's (13.0 for `+cu130`). |
+| "SSL certificate problem: unable to get local issuer certificate" from `git`, or `CERTIFICATE_VERIFY_FAILED` from conda or pip | Your network inspects HTTPS. See [Corporate networks](#corporate-networks). |
+| `CondaHTTPError: HTTP 429 Too Many Requests` for repo.anaconda.com | Anaconda's channel refuses your network. Use the current `environment.yml`, which avoids that channel, or add `-c conda-forge --override-channels` to your own conda commands. See [Corporate networks](#corporate-networks). |
 | "4-bit quantisation needs the bitsandbytes package" or a bitsandbytes CUDA error on Windows | `pip install -U bitsandbytes` (it ships Windows wheels). Until that works, set **Weights** to fp16 (`--precision fp16`): models up to about 3B fit an 8 GB card. |
 | "Not enough memory (RAM) to load …" | The weights don't fit in the computer's main memory, which is what a CPU run uses: about 4 bytes per parameter at fp32, so 6 GB for a 1.5B model. Choose a smaller model and close other programs. |
 | CUDA out of memory | The app already halves a batch that runs out of memory and retries. With the default processing order (longest first) this shows in the first batch, and a run whose longest texts don't fit can stop before generating anything: choose **Shortest first** (`--order shortest`) to generate the shorter texts first. If a single row still fails, lower the batch size, lower the max input characters, choose 4-bit, or use a smaller model. Close other programs that use the GPU (check with `nvidia-smi`). Long outputs (PII redaction, 1024 tokens) need the most memory. |
@@ -541,7 +574,7 @@ report a problem.
 
 ```
 app.py                            Streamlit entry point
-environment.yml                   conda environment (CUDA)
+environment.yml                   conda environment: Python and CUDA PyTorch
 examples/sample_feedback.csv      gold-labelled sample data
 docs/MIGRATING.md                 upgrading from version 1
 docs/screenshot.png               the screenshot above

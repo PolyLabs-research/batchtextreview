@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Installing with an NVIDIA GPU. `environment.yml` could install a CPU-only PyTorch on Windows,
+  because pip took a newer CPU build from PyPI over the CUDA build. It now takes PyTorch from
+  download.pytorch.org only, and uses the CUDA 13.0 build. The app is installed in a second step,
+  `pip install -e ".[llm]"`.
+- `conda env create -f environment.yml` failed on networks that Anaconda's channel refuses (HTTP
+  429), because conda added that channel from the user's settings. The file now excludes it.
+- The README explains the certificate errors that git, conda and pip give on networks with TLS
+  inspection, and how to fix each one.
+
 ## [2.1.0] - 2026-10-14
 
 ### Added
