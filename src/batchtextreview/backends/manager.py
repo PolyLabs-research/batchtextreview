@@ -17,7 +17,7 @@ import threading
 from collections.abc import Callable, Iterator
 
 from batchtextreview.backends.base import Backend
-from batchtextreview.models import model_revision
+from batchtextreview.models import api_provider, model_revision
 
 BackendFactory = Callable[[str, str], Backend]
 """(model_id, precision) -> loaded Backend. May raise ModelLoadError."""
@@ -26,13 +26,19 @@ _log = logging.getLogger(__name__)
 
 
 def default_factory(model_id: str, precision: str) -> Backend:
-    """Demo model ids (``demo://...``) -> FakeBackend; anything else ->
-    TransformersBackend (imported lazily so torch is only loaded when a real
-    model is needed)."""
+    """Demo model ids (``demo://...``) -> FakeBackend; cloud API ids
+    (``anthropic:...``, ``openai:...``) -> the provider's backend; anything
+    else -> TransformersBackend (imported lazily so torch is only loaded when
+    a local model is needed)."""
     if model_id.startswith("demo://"):
         from batchtextreview.backends.fake import demo_backend
 
         return demo_backend(model_id)
+
+    if api_provider(model_id):
+        from batchtextreview.backends.api import make_api_backend
+
+        return make_api_backend(model_id)
 
     from batchtextreview.backends.transformers_backend import TransformersBackend
 

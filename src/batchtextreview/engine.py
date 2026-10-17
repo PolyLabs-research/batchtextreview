@@ -168,13 +168,13 @@ class RunConfig:
     ) -> RunConfig:
         """Convenience constructor that resolves "auto" precision.
 
-        The demo model always gets precision "none". A local model folder
-        gets its current ``model_revision``.
+        The demo model and cloud API models always get precision "none". A
+        local model folder gets its current ``model_revision``.
         """
         from batchtextreview.backends.base import resolve_precision
         from batchtextreview.models import model_revision
 
-        resolved = "none" if model.is_demo else resolve_precision(precision)
+        resolved = "none" if model.is_demo or model.is_api else resolve_precision(precision)
         return cls(
             model_id=model.repo,
             model_label=model.label,
@@ -304,6 +304,11 @@ class RunStats:
     """Generated or cached rows whose output reached ``max_new_tokens`` (as
     reported by the backend, and stored with the output) and may be cut
     off."""
+    input_tokens: int = 0
+    """Tokens sent to a cloud API model in this run, as the provider counted
+    them (0 for models that run on this computer)."""
+    output_tokens: int = 0
+    """Tokens a cloud API model generated in this run, reasoning included."""
 
 
 @dataclass
@@ -791,10 +796,16 @@ class _Run:
         failure: tuple[type[BaseException], str] | None = None
         message = ""
         try:
-            raw, flags = self._generate(backend, batch)
+            raw, flags, row_errors = self._generate(backend, batch)
         except Exception as exc:
             message = _describe_error(exc, ERROR_MESSAGE_LIMIT)
             self._log_failure(f"{label} ({_count(len(batch), 'prompt')}) failed", message)
+            if getattr(exc, "fatal", False) is True:
+                # Retrying the rows one by one can't help (a rejected API key).
+                plain = _describe_error(exc, ERROR_MESSAGE_LIMIT, plain_backend_errors=True)
+                self._fail(batch, plain)
+                self.aborted_reason = plain
+                return plain
             # Only the type and text are kept: the exception's traceback can
             # hold the backend's frames (and their GPU tensors) alive.
             failure = (type(exc), str(exc))
@@ -810,8 +821,43 @@ class _Run:
             self._log_failure(f"{label} failed", message)
             self._fail(batch, message)
             return message
+        if any(row_errors):
+            return self._commit_some(batch, cleaned, flags, row_errors, label)
         self._commit(batch, cleaned, flags)
         return None
+
+    def _commit_some(
+        self,
+        batch: list[str],
+        outputs: list[str],
+        flags: list[bool],
+        row_errors: list[str | None],
+        label: str,
+    ) -> str | None:
+        """Keep the rows of a batch that succeeded and fail the rows the
+        backend reported an error for (``last_row_errors``) - a cloud API
+        answers each prompt separately, so one refused text must not cost
+        the other answers of its batch. Returns the first error when no row
+        succeeded, else None."""
+        good = [i for i, error in enumerate(row_errors) if not error]
+        bad = [i for i, error in enumerate(row_errors) if error]
+        if good:
+            self._commit(
+                [batch[i] for i in good], [outputs[i] for i in good], [flags[i] for i in good]
+            )
+        first = _clip(str(row_errors[bad[0]]), ERROR_MESSAGE_LIMIT)
+        # No traceback: the backend reported these, nothing was raised.
+        log.warning(
+            "Run %s: %s: %s of %s failed: %s",
+            self.config.run_id,
+            label,
+            _count(len(bad), "row"),
+            f"{len(batch):,}",
+            first,
+        )
+        for i in bad:
+            self._fail([batch[i]], _clip(str(row_errors[i]), ERROR_MESSAGE_LIMIT))
+        return None if good else first
 
     def _isolate(
         self,
@@ -853,7 +899,7 @@ class _Run:
             if eta is not None:
                 eta.start_batch(self.prompt_chars.get(key, 0))
             try:
-                raw, flags = self._generate(backend, [key])
+                raw, flags, row_errors = self._generate(backend, [key])
                 cleaned = _checked_outputs(raw, 1)
             except Exception as exc:
                 if position < 2 and (type(exc), str(exc)) == batch_failure:
@@ -865,10 +911,14 @@ class _Run:
                 self._fail([key], message)
                 failed += 1
             else:
-                succeeded += 1
-                self._commit([key], cleaned, flags)
-                if self.aborted_reason is not None:  # the store failed
-                    break
+                if row_errors[0]:  # the backend reported this row failed
+                    self._fail([key], _clip(row_errors[0], ERROR_MESSAGE_LIMIT))
+                    failed += 1
+                else:
+                    succeeded += 1
+                    self._commit([key], cleaned, flags)
+                    if self.aborted_reason is not None:  # the store failed
+                        break
             self._emit(
                 "generating",
                 f"{label}: retrying rows one at a time ({position + 1:,} of {len(batch):,})",
@@ -883,9 +933,11 @@ class _Run:
             )
         return None if succeeded else batch_message
 
-    def _generate(self, backend: Any, keys: list[str]) -> tuple[list[Any], list[bool]]:
-        """(raw outputs, hit-limit flags) for ``keys``; raises what the
-        backend raises."""
+    def _generate(
+        self, backend: Any, keys: list[str]
+    ) -> tuple[list[Any], list[bool], list[str | None]]:
+        """(raw outputs, hit-limit flags, per-row errors) for ``keys``;
+        raises what the backend raises."""
         assert self.plan is not None
         config, plan = self.config, self.plan
         prompts = [prompting.render_prompt(config.template, plan.snippets[k]) for k in keys]
@@ -897,7 +949,11 @@ class _Run:
             self.generation_s += seconds
         if self.eta is not None:
             self.eta.observe(sum(len(p) for p in prompts), seconds)
-        return raw, _hit_limit_flags(backend, len(prompts))
+        usage = _usage(backend)
+        if usage is not None:
+            self.stats.input_tokens += usage[0]
+            self.stats.output_tokens += usage[1]
+        return raw, _hit_limit_flags(backend, len(prompts)), _row_errors(backend, len(prompts))
 
     def _commit(self, keys: list[str], outputs: list[str], flags: list[bool]) -> None:
         """Save finished outputs, then mark their rows generated."""
@@ -1238,6 +1294,35 @@ def _hit_limit_flags(backend: Any, n_prompts: int) -> list[bool]:
     except Exception:  # a property that raises, a flag that can't be a bool...
         pass
     return [False] * n_prompts
+
+
+def _row_errors(backend: Any, n_prompts: int) -> list[str | None]:
+    """The backend's ``last_row_errors`` for the call just made: an error
+    message for each prompt that failed on its own, None for the others.
+    All None when the backend doesn't report them (or reports the wrong
+    number)."""
+    try:
+        errors = getattr(backend, "last_row_errors", None)
+        if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes)):
+            values = [str(error) if error else None for error in errors]
+            if len(values) == n_prompts:
+                return values
+    except Exception:
+        pass
+    return [None] * n_prompts
+
+
+def _usage(backend: Any) -> tuple[int, int] | None:
+    """The backend's ``last_usage`` (input tokens, output tokens) for the
+    call just made, or None when it doesn't report one."""
+    try:
+        usage = getattr(backend, "last_usage", None)
+        if usage is None:
+            return None
+        sent, generated = usage
+        return max(0, int(sent)), max(0, int(generated))
+    except Exception:
+        return None
 
 
 def _clip(text: str, limit: int) -> str:
