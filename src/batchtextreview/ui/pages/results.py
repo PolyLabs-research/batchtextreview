@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Final
 import pandas as pd
 import streamlit as st
 
-from batchtextreview import engine, results
+from batchtextreview import engine, models, results
 from batchtextreview.labels import INVALID, label_key
 from batchtextreview.prompting import render_prompt
 from batchtextreview.ui import analysis as an
@@ -1823,6 +1823,20 @@ def _card(title: str, rows: list[tuple[str, Any]]) -> None:
         components.facts(rows, label_width=190)
 
 
+def tokens_used(stats: Any, spec: models.ModelSpec | None) -> str:
+    """ "12k in · 300 out · ≈ $0.01 at list prices" for a cloud run (the
+    cost only when the model's price is known); "None" when nothing was
+    sent."""
+    sent, generated = int(stats.input_tokens or 0), int(stats.output_tokens or 0)
+    if not (sent or generated):
+        return "None (all rows from saved outputs)" if stats.cached else "None"
+    words = f"{fmt.token_count(sent)} in · {fmt.token_count(generated)} out"
+    if spec is not None and spec.price:
+        cost = (sent * spec.price[0] + generated * spec.price[1]) / 1e6
+        words += f" · ≈ {fmt.money(cost)} at list prices"
+    return words
+
+
 def _details_tab(job: Job, snap: JobSnapshot, built: an.JobAnalysis) -> None:
     ctx = built.context
     result = built.result
@@ -1870,17 +1884,27 @@ def _details_tab(job: Job, snap: JobSnapshot, built: an.JobAnalysis) -> None:
         )
     model_col, data_col = st.columns(2, gap="medium")
     with model_col:
+        provider = models.API_PROVIDERS.get(models.api_provider(cfg.model_id) or "")
+        if provider:  # a cloud model: the same number of rows, so the cards line up
+            weights = ("Runs on", f"{provider}'s servers")
+            batch = ("Requests at once", f"{request.batch_size:,}")
+            used = tokens_used(stats, models.find_model(cfg.model_id))
+            last = ("Tokens used", fmt.no_math(used))
+        else:
+            weights = ("Weights", fmt.precision(cfg.precision))
+            batch = ("Batch size", f"{request.batch_size:,}")
+            last = ("Max characters per batch", f"{request.max_batch_chars:,}")
         _card(
             "Model",
             [
                 ("Model", text(cfg.model_label)),
                 ("Model id", code(cfg.model_id)),
-                ("Weights", fmt.precision(cfg.precision)),
+                weights,
                 ("Max output tokens", f"{cfg.max_new_tokens:,}"),
                 ("Max input characters", f"{cfg.max_input_chars:,}"),
-                ("Batch size", f"{request.batch_size:,}"),
+                batch,
                 ("Processing order", engine.ORDER_LABELS.get(request.order)),
-                ("Max characters per batch", f"{request.max_batch_chars:,}"),
+                last,
             ],
         )
     with data_col:

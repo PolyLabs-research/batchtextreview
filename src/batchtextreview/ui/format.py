@@ -193,9 +193,61 @@ def source_word(value: Any) -> str:
 
 def model_name(model_id: str) -> str:
     """A model id as a short name: the last part of a repo id or folder path
-    ("Qwen/Qwen2.5-3B-Instruct" -> "Qwen2.5-3B-Instruct")."""
-    text = str(model_id).replace("\\", "/").rstrip("/")
+    ("Qwen/Qwen2.5-3B-Instruct" -> "Qwen2.5-3B-Instruct"), and a cloud model
+    without its provider ("anthropic:claude-opus-4-8" -> "claude-opus-4-8")."""
+    text = str(model_id)
+    prefix, sep, rest = text.partition(":")
+    if sep and prefix in ("anthropic", "openai") and rest:
+        text = rest
+    text = text.replace("\\", "/").rstrip("/")
     return text.rsplit("/", 1)[-1] or str(model_id)
+
+
+def price(per_million: tuple[float, float] | None) -> str:
+    """List price per million input / output tokens:
+    "$0.10 / $0.50 per M tokens"; "–" when unknown."""
+    if not per_million:
+        return DASH
+    sent, generated = per_million
+    return f"{_dollars(sent)} / {_dollars(generated)} per M tokens"
+
+
+def money(value: float | None) -> str:
+    """US dollars: "$0.04", "$12.30", "$1,204"; "< $0.01" for a positive
+    amount below a cent; "–" when unknown."""
+    amount = _finite(value)
+    if amount is None:
+        return DASH
+    if 0 < amount < 0.01:
+        return "< $0.01"
+    return _dollars(amount)
+
+
+def _dollars(amount: float) -> str:
+    if amount >= 1000:
+        return f"${amount:,.0f}"
+    return f"${amount:,.2f}"
+
+
+def no_math(text: str) -> str:
+    """``text`` with its dollar signs escaped, for Markdown: Streamlit reads
+    "$0.10 / $0.50" as a LaTeX formula."""
+    return str(text).replace("$", "\\$")
+
+
+def token_count(n: float | None) -> str:
+    """Tokens, rounded the way people say them: "940", "4.2k", "310k", "1.3M"."""
+    value = _finite(n)
+    if value is None:
+        return DASH
+    value = max(0.0, value)
+    if value < 1000:
+        return f"{value:,.0f}"
+    if value < 10_000:
+        return f"{value / 1000:.1f}k"
+    if value < 1_000_000:
+        return f"{value / 1000:,.0f}k"
+    return f"{value / 1_000_000:,.1f}M"
 
 
 def distinct_model_names(names: Sequence[str], keys: Sequence[str]) -> list[str]:

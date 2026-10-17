@@ -28,6 +28,9 @@ log = logging.getLogger(__name__)
 KeySource = Literal["session", "env", "keyring"]
 
 ENV_VARS: dict[str, str] = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+ANTHROPIC_OTHER_CREDENTIALS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE")
+"""Other ways the Anthropic SDK finds credentials (an OAuth token, a profile
+saved by ``ant auth login``)."""
 KEYRING_SERVICE = "batchtextreview"
 """Service name of saved keys in the system keyring (one entry per provider)."""
 
@@ -81,6 +84,18 @@ def lookup(provider: str) -> tuple[str, KeySource] | None:
     if saved:
         return saved, "keyring"
     return None
+
+
+def credentials_available(provider: str) -> bool:
+    """True when a request to ``provider`` can authenticate: a key from
+    :func:`lookup`, an OpenAI-compatible server (``OPENAI_BASE_URL``, which
+    may need no key), or Anthropic's ``ANTHROPIC_AUTH_TOKEN`` /
+    ``ANTHROPIC_PROFILE``."""
+    if lookup(provider):
+        return True
+    if provider == "openai":
+        return bool(_clean(os.environ.get("OPENAI_BASE_URL")))
+    return any(_clean(os.environ.get(name)) for name in ANTHROPIC_OTHER_CREDENTIALS)
 
 
 def set_session_key(provider: str, key: str | None) -> None:

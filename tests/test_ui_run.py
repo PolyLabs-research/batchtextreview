@@ -12,6 +12,7 @@ Run page; it has its own tests.
 
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
@@ -24,6 +25,7 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+from batchtextreview import models
 from batchtextreview.engine import Progress
 from batchtextreview.jobs import JobSnapshot
 from batchtextreview.ui import components, state
@@ -1141,3 +1143,84 @@ def test_progress_bar_measures_work(
     assert len(bars) == 1
     assert bars[0].proto.value == 37
     assert re.match(r"\d / 6 rows", bars[0].proto.text)
+
+
+# ---- cloud models -------------------------------------------------------------
+
+
+@pytest.fixture
+def no_api_keys(monkeypatch: pytest.MonkeyPatch):
+    from batchtextreview import api_keys
+
+    for name in (
+        *api_keys.ENV_VARS.values(),
+        "OPENAI_BASE_URL",
+        *api_keys.ANTHROPIC_OTHER_CREDENTIALS,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(api_keys, "_keyring_backend", lambda: None)
+    api_keys._reset_for_tests()
+    yield
+    api_keys._reset_for_tests()
+
+
+HAIKU = "anthropic:claude-haiku-5-5"
+
+
+@pytest.mark.ui
+def test_cloud_model_without_a_key_cannot_run(app: AppTest, data_dir: Path, no_api_keys) -> None:
+    pytest.importorskip("anthropic")
+    at = _load_feedback(app, data_dir)
+    assert "Claude Haiku 5.5 · Anthropic API" in at.selectbox(key=run_page.MODEL_KEY).options
+    at.selectbox(key=run_page.MODEL_KEY).set_value(HAIKU).run()
+    assert not at.exception
+    text = _markdown(at)
+    assert "Anthropic API" in text and "No API key" in text
+    assert "$0.10 / $0.50 per M tokens" in text
+    button = at.button(key=run_page.RUN_BUTTON_KEY)
+    assert button.disabled
+    assert "No Anthropic API key is set" in text
+    assert at.segmented_control(key=run_page.PRECISION_KEY).disabled
+    assert "requests at once" in text and "weights" not in text.split("requests at once")[1][:40]
+
+
+@pytest.mark.ui
+def test_cloud_model_asks_before_sending_the_texts(
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, no_api_keys
+) -> None:
+    pytest.importorskip("anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-0000")
+    _use_backend(monkeypatch)  # no request leaves the test
+    at = _load_feedback(app, data_dir)
+    at.selectbox(key=run_page.MODEL_KEY).set_value(HAIKU).run()
+    assert not at.exception
+    text = _markdown(at)
+    assert "Key from ANTHROPIC_API_KEY" in text
+    # 6 rows: 1 blank and 1 duplicate, so 4 distinct texts are sent.
+    assert "Sends 4 texts to Anthropic: about" in text and "at list prices" in text
+    button = at.button(key=run_page.RUN_BUTTON_KEY)
+    assert button.disabled and "Tick “Send these texts to Anthropic”" in text
+    consent = at.checkbox(key=f"{run_page.API_CONSENT_KEY}::anthropic")
+    assert consent.value is False
+    consent.check().run()
+    assert not at.button(key=run_page.RUN_BUTTON_KEY).disabled
+    at.button(key=run_page.RUN_BUTTON_KEY).click().run()
+    assert not at.exception
+    job = _job_manager().get(at.session_state[state.SESSION_JOBS][0])
+    assert job is not None and job.wait(15) and job.snapshot().state == "succeeded"
+    assert job.request.config.model_id == HAIKU
+    assert job.request.config.precision == "none"
+
+
+def test_api_usage_estimate_counts_texts_not_saved_yet() -> None:
+    from batchtextreview import engine
+
+    spec = models.find_model(HAIKU)
+    assert spec is not None
+    config = engine.RunConfig.build(spec, "Label: {text}", 8)
+    texts = ["abcd" * 10, "", "abcd" * 10, "xy" * 50]
+    plan = engine.plan_run(config, texts, None)
+    calls, sent, answers = run_page.api_usage_estimate(plan, config)
+    assert calls == 2 and answers == 16
+    # "Label: " (7 characters) + the text, at 4 characters a token.
+    assert sent == math.ceil((7 + 40 + 7 + 100) / run_page.CHARS_PER_TOKEN)

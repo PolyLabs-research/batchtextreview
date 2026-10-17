@@ -105,6 +105,12 @@ _CUSTOM_MODEL = "__custom__"
 _SOURCE_LABELS = {"upload": "Upload", "path": "From a folder", "sample": "Sample data"}
 _SCOPE_LABELS = {"all": "All", "first": "First rows", "random": "Random sample"}
 _PRECISION_CHOICES = ("auto", "4bit", "fp16", "fp32")
+API_CONSENT_KEY = "run.api_consent"
+"""Prefix of the per-provider "send these texts to <provider>" checkbox (one
+per browser session: never remembered across sessions)."""
+CHARS_PER_TOKEN = 4
+"""Rough characters per token for the Run page's cost estimate (English
+text; other languages, and code, use more tokens)."""
 _FORMAT_NAMES = {
     "csv": "CSV",
     "tsv": "TSV",
@@ -222,7 +228,9 @@ def render() -> None:
     jobs = resources.get_job_manager()
     active = jobs.active()
 
-    components.page_header("Run", "Apply a prompt to every row of a table with a local model.")
+    components.page_header(
+        "Run", "Apply a prompt to every row of a table with a local or cloud model."
+    )
 
     # Every element keeps its place whether or not a run is in progress: when
     # a run ends and the page reruns, an element tree that shifted would make
@@ -1312,7 +1320,7 @@ def _plan_settings(
     data_step: _DataStep,
 ) -> tuple[_PlanSettings, _Selection | None]:
     """Model, row scope and the Advanced popover, in that order."""
-    specs = models.available_models(include_demo=settings.demo_mode)
+    specs = [*models.available_models(include_demo=settings.demo_mode), *models.api_models()]
     by_repo = {s.repo: s for s in specs}
     options = [*by_repo, _CUSTOM_MODEL]
     last = _safe(lambda: store.get_setting("last_model"), None)
@@ -1332,8 +1340,9 @@ def _plan_settings(
         options,
         key=MODEL_KEY,
         format_func=lambda r: "Custom model…" if r == _CUSTOM_MODEL else _model_label(by_repo[r]),
-        help="Every built-in model fits an 8 GB GPU at 4-bit. Larger models are slower "
-        "but usually more accurate.",
+        help="Every built-in local model fits an 8 GB GPU at 4-bit; larger models are slower "
+        "but usually more accurate. Cloud models (Anthropic, OpenAI) run on the provider's "
+        "servers: they need an API key, and the texts are sent to the provider.",
         persist_state="session",
     )
     spec: models.ModelSpec | None = None
@@ -1341,14 +1350,19 @@ def _plan_settings(
     if choice == _CUSTOM_MODEL:
         _init(CUSTOM_MODEL_KEY, str(last) if restore_custom else "")
         raw = st.text_input(
-            "Hugging Face repo id or local model folder",
+            "Hugging Face repo id, local model folder or cloud model",
             key=CUSTOM_MODEL_KEY,
-            placeholder="e.g. Qwen/Qwen2.5-0.5B-Instruct",
+            placeholder="e.g. Qwen/Qwen2.5-0.5B-Instruct or anthropic:claude-opus-4-8",
+            help="A cloud model is the provider and its model id: anthropic:… or openai:… "
+            "(with OPENAI_BASE_URL set, any model of an OpenAI-compatible server).",
             persist_state="session",
         )
         value = strip_quotes(raw or "")
         if not value:
-            problem = "Enter a Hugging Face repo id or a local model folder."
+            problem = (
+                "Enter a Hugging Face repo id, a local model folder, or a cloud model such as "
+                "anthropic:claude-opus-4-8."
+            )
         else:
             try:
                 spec = models.custom_model(value)
@@ -1372,6 +1386,7 @@ def _plan_settings(
         st.session_state[ORDER_KEY] = remembered_order(store)
     _ensure_option(ORDER_KEY, list(engine.ORDERS), engine.DEFAULT_ORDER)
     is_demo = spec is not None and spec.is_demo
+    is_api = spec is not None and spec.is_api
     auto_resolves = PRECISION_LABELS[resolve_precision("auto", device)]
 
     with st.container(horizontal=True, vertical_alignment="center", gap="small"):
@@ -1401,7 +1416,8 @@ def _plan_settings(
                     key=BATCH_KEY,
                     help="Rows sent to the model together. Bigger batches are faster until "
                     "GPU memory runs out; on an out-of-memory error the batch is split "
-                    "automatically.",
+                    "automatically. For a cloud model, the number of requests sent at once: "
+                    "lower it if the provider reports rate limits.",
                     persist_state="session",
                 )
             )
@@ -1425,7 +1441,7 @@ def _plan_settings(
                     format_func=fmt.precision,
                     key=PRECISION_KEY,
                     required=True,
-                    disabled=is_demo,
+                    disabled=is_demo or is_api,
                     help="Numeric precision the model weights are loaded in. 4-bit fits the "
                     "largest models in 8 GB of GPU memory.",
                     persist_state="session",
@@ -1434,6 +1450,8 @@ def _plan_settings(
             )
             if is_demo:
                 st.caption("The demo model has no weights to load.")
+            elif is_api:
+                st.caption("Cloud models run on the provider's servers: nothing loads here.")
             else:
                 st.caption(f"Auto = {auto_resolves} on this machine.")
                 if precision == "4bit" and not (device.kind == "cuda" and device.bitsandbytes):
@@ -1462,11 +1480,14 @@ def _plan_settings(
                     if over
                     else "No selected row is longer than this."
                 )
-        precision_note = "" if is_demo else f" · {fmt.precision(precision)} weights"
-        if precision == "auto" and not is_demo:
+        precision_note = "" if is_demo or is_api else f" · {fmt.precision(precision)} weights"
+        if precision == "auto" and not (is_demo or is_api):
             precision_note += f" ({fmt.precision(resolve_precision('auto', device))})"
+        batch_note = (
+            f"{fmt.plural(batch_size, 'request')} at once" if is_api else f"batch size {batch_size}"
+        )
         st.caption(
-            f"Up to {fmt.plural(max_tokens, 'output token')} · batch size {batch_size} · "
+            f"Up to {fmt.plural(max_tokens, 'output token')} · {batch_note} · "
             f"{engine.ORDER_LABELS[order].lower()}" + precision_note
         )
 
@@ -1593,6 +1614,10 @@ def _plan_summary_and_button(
         _discard_button(store, config, f"{spec.label} · {task.preset.title}")
 
     problem = _first_problem(data_step, task, plan_settings, plan, device, jobs.active())
+    if spec is not None and spec.is_api and plan is not None and config is not None:
+        consent = _cloud_notice(spec, plan, config)
+        if problem is None and plan.n_todo_rows and not consent:
+            problem = f"Tick “Send these texts to {spec.provider_label}” to run a cloud model."
     existing = _same_finished_job(jobs) if plan is not None and plan.fully_cached else None
     if existing is not None and problem is None:
         # The very same run finished in this session: open it rather than
@@ -1635,6 +1660,48 @@ def _plan_summary_and_button(
     if clicked and problem is None and config is not None and selection is not None:
         _submit(store, jobs, config, texts, data_step, task, selection, plan_settings, exact)
     return None
+
+
+def _cloud_notice(spec: models.ModelSpec, plan: engine.RunPlan, config: engine.RunConfig) -> bool:
+    """What a cloud model run sends and roughly costs, and the checkbox
+    that agrees to send it. True when ticked (or when nothing is sent)."""
+    if not plan.n_todo_rows:
+        return True
+    provider = spec.provider_label
+    calls, sent, answers = api_usage_estimate(plan, config)
+    words = (
+        f"Sends {fmt.plural(calls, 'text')} to {provider}: about "
+        f"{fmt.token_count(sent)} input tokens, and answers of up to "
+        f"{fmt.plural(config.max_new_tokens, 'token')} each"
+    )
+    if spec.price:
+        cost = (sent * spec.price[0] + answers * spec.price[1]) / 1e6
+        words += (
+            f" · at most about {fmt.no_math(fmt.money(cost))} at list prices "
+            f"({models.PRICES_AS_OF}), "
+            "plus any reasoning"
+        )
+    st.caption(f":material/cloud_upload: {words}.")
+    return bool(
+        st.checkbox(
+            f"Send these texts to {provider}",
+            key=f"{API_CONSENT_KEY}::{spec.provider}",
+            help=f"Cloud models run on {provider}'s servers: each text is sent to {provider} "
+            "over the internet and handled under your API account's terms. Only send data "
+            "you're allowed to share with them. Asked once per browser session.",
+        )
+    )
+
+
+def api_usage_estimate(plan: engine.RunPlan, config: engine.RunConfig) -> tuple[int, int, int]:
+    """(requests, input tokens, most answer tokens) for the texts a run
+    would send - one request per distinct text not saved yet. Tokens are
+    estimated at :data:`CHARS_PER_TOKEN` characters each."""
+    todo = [key for key in plan.snippets if key not in plan.cached]
+    n_text = config.template.count(prompting.TEXT)
+    overhead = len(config.template) - n_text * len(prompting.TEXT)
+    chars = sum(overhead + n_text * len(plan.snippets[key]) for key in todo)
+    return len(todo), math.ceil(chars / CHARS_PER_TOKEN), len(todo) * config.max_new_tokens
 
 
 def _discard_button(store: Store, config: engine.RunConfig, name: str) -> None:
@@ -1772,6 +1839,8 @@ def model_problem(spec: models.ModelSpec, precision: str, device: DeviceInfo) ->
     """Why ``spec`` can't be loaded at ``precision`` on this machine - checked
     before running, so a run that is certain to fail at load never starts -
     or None. Only called when the model has to be loaded."""
+    if spec.is_api:
+        return api_model_problem(spec)
     if not device.has_torch:
         return (
             "PyTorch isn't installed, so only the demo model can run. "
@@ -1813,6 +1882,14 @@ def model_problem(spec: models.ModelSpec, precision: str, device: DeviceInfo) ->
             "downloaded model or a local folder, or unset HF_HUB_OFFLINE and restart the app."
         )
     return None
+
+
+def api_model_problem(spec: models.ModelSpec) -> str | None:
+    """Why a cloud model can't run here (its SDK isn't installed, or no
+    credentials are set), or None."""
+    from batchtextreview.backends import api
+
+    return api.setup_problem(spec.provider or "", in_app=True)
 
 
 def _submit(
@@ -1916,6 +1993,9 @@ def _progress_panel(job_id: str) -> None:
     mine = job.id in st.session_state.get(state.SESSION_JOBS, [])
     if snap.state == "queued" or p.phase == "planning":
         label = "Checking saved outputs…"
+    elif p.phase == "loading" and models.api_provider(config.model_id):
+        provider = models.API_PROVIDERS[models.api_provider(config.model_id) or ""]
+        label = f"Connecting to {provider} · checking {config.model_label}…"
     elif p.phase == "loading":
         label = f"Loading {config.model_label}…"
         size = _first_download_gb(config.model_id)
@@ -1975,7 +2055,7 @@ def _first_download_gb(model_id: str) -> int | None:
     nothing will be downloaded (demo model, local folder, already in the
     cache) or the size isn't known."""
     spec = models.find_model(model_id) or _safe(lambda: models.custom_model(model_id), None)
-    if spec is None or spec.is_demo or spec.is_local:
+    if spec is None or spec.is_demo or spec.is_api or spec.is_local:
         return None
     if resources.downloaded(spec.repo) is not False or resources.offline_mode():
         return None
@@ -2300,6 +2380,8 @@ def _extension_list() -> str:
 
 def _model_label(spec: models.ModelSpec) -> str:
     """ "Qwen2.5-3B-Instruct · 3B · downloaded" for the model picker."""
+    if spec.is_api:
+        return f"{spec.label} · {spec.provider_label} API"
     label = f"{spec.label} · {spec.size_label}" if spec.size_label else spec.label
     if not spec.is_demo and resources.downloaded(spec.repo):
         label += " · downloaded"

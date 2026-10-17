@@ -153,40 +153,10 @@ class ApiBackend:
     def _failed(self, exc: BaseException) -> _Answer:
         """A request that failed after the SDK's retries: raises _Fatal for
         what every request would hit, else this row's error."""
-        status = _status(exc)
-        detail = _api_message(exc)
-        who = self.provider_label
-        if status == 401:
-            raise _Fatal(f"{who} rejected the API key ({detail}).", _key_hint(self.provider))
-        if status == 403:
-            raise _Fatal(
-                f"{who} refused the request: this key can't use {self.model} ({detail}).",
-                "Check the key's permissions and the account's model access.",
-            )
-        if status == 404:
-            raise _Fatal(
-                f"{who} has no model “{self.model}” that this key can use ({detail}).",
-                "Check the model id on the provider's model list.",
-            )
-        if status == 429:
-            return _Answer(
-                error=f"{who} rate limit still exceeded after {MAX_RETRIES} retries "
-                f"({detail}). Lower the batch size (requests sent at once), then run "
-                "again to retry the failed rows."
-            )
-        if status is not None and status >= 500:
-            return _Answer(error=f"{who} server error {status} ({detail}). Run again to retry.")
-        if status is not None:
-            return _Answer(error=f"{who} rejected the request: {detail}")
-        name = type(exc).__name__
-        if "Timeout" in name:
-            return _Answer(error=f"No answer from {who} in time. Run again to retry.")
-        if "Connection" in name:
-            return _Answer(
-                error=f"Couldn't reach {who} ({detail}). Check the network connection or "
-                "proxy (see Corporate networks in the README)."
-            )
-        return _Answer(error=f"{name}: {detail}")
+        fatal, message, hint = _explain(self.provider, self.model, exc)
+        if fatal:
+            raise _Fatal(message, hint)
+        return _Answer(error=message)
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +418,7 @@ def _anthropic_client() -> Any:
         ) from None
     key = api_keys.get_key("anthropic")
     if not key and not any(
-        os.environ.get(name) for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE")
+        api_keys._clean(os.environ.get(name)) for name in api_keys.ANTHROPIC_OTHER_CREDENTIALS
     ):
         raise ModelLoadError("No Anthropic API key is set.", _key_hint("anthropic"))
     try:
@@ -460,8 +430,111 @@ def _anthropic_client() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Checks for the Models & settings page
+# ---------------------------------------------------------------------------
+
+SDK_PACKAGES: dict[str, str] = {"anthropic": "anthropic", "openai": "openai"}
+
+
+def sdk_installed(provider: str) -> bool:
+    """True when the provider's Python SDK can be imported."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(SDK_PACKAGES[provider]) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def setup_problem(provider: str, *, in_app: bool) -> str | None:
+    """Why a cloud model of ``provider`` can't run here - its SDK isn't
+    installed, or no credentials are set - or None. ``in_app``: point to
+    the Models & settings page (else to the environment variable)."""
+    name = API_PROVIDERS[provider]
+    if not sdk_installed(provider):
+        return (
+            f"The {SDK_PACKAGES[provider]} package isn't installed. Install the cloud API extra "
+            '(pip install -e ".[api]")' + (", then restart the app." if in_app else ".")
+        )
+    if api_keys.credentials_available(provider):
+        return None
+    env = api_keys.ENV_VARS[provider]
+    if in_app:
+        return (
+            f"No {name} API key is set. Add one on the Models & settings page, or set {env} "
+            "and restart the app."
+        )
+    return (
+        f"No {name} API key is set. Set {env}, or save a key on the app's Models & settings page."
+    )
+
+
+def check_connection(provider: str) -> list[str]:
+    """The ids of the models the current key can use (one request to the
+    provider's model list). Raises ModelLoadError, worded like a load
+    error, when there is no key or the provider can't be reached."""
+    client = _anthropic_client() if provider == "anthropic" else _openai_client()
+    try:
+        return sorted(str(getattr(m, "id", "")) for m in client.models.list())
+    except Exception as exc:
+        _, message, hint = _explain(provider, "", exc)
+        raise ModelLoadError(message, hint) from None
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _explain(provider: str, model: str, exc: BaseException) -> tuple[bool, str, str | None]:
+    """(fatal, message, hint) for a request that failed after the SDK's
+    retries. Fatal: no request can succeed (rejected key, no such model)."""
+    status = _status(exc)
+    detail = _api_message(exc)
+    who = API_PROVIDERS.get(provider, provider)
+    if status == 401:
+        return True, f"{who} rejected the API key ({detail}).", _key_hint(provider)
+    if status == 403:
+        what = f"this key can't use {model}" if model else "this key isn't allowed"
+        return (
+            True,
+            f"{who} refused the request: {what} ({detail}).",
+            "Check the key's permissions and the account's model access.",
+        )
+    if status == 404:
+        if not model:
+            return True, f"{who} answered 404 Not Found ({detail}).", None
+        return (
+            True,
+            f"{who} has no model “{model}” that this key can use ({detail}).",
+            "Check the model id on the provider's model list.",
+        )
+    if status == 429:
+        return (
+            False,
+            f"{who} rate limit still exceeded after {MAX_RETRIES} retries ({detail}). Lower the "
+            "batch size (requests sent at once), then run again to retry the failed rows.",
+            None,
+        )
+    if status is not None and status >= 500:
+        return False, f"{who} server error {status} ({detail}). Run again to retry.", None
+    if status is not None:
+        return False, f"{who} rejected the request: {detail}", None
+    name = type(exc).__name__
+    if "Timeout" in name:
+        return False, f"No answer from {who} in time. Run again to retry.", None
+    if "Connection" in name:
+        return (
+            False,
+            f"Couldn't reach {who} ({detail}). Check the network connection or proxy (see "
+            "Corporate networks in the README).",
+            None,
+        )
+    return False, f"{name}: {detail}", None
 
 
 def _key_hint(provider: str) -> str:

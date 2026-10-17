@@ -507,6 +507,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         labels = preset.resolve_labels(var)
     spec = _resolve_model(args.model)
+    if spec.is_api:
+        from batchtextreview.backends import api
+
+        problem = api.setup_problem(spec.provider or "", in_app=False)
+        if problem:
+            raise CliError(problem)
     output_path, fmt = _output_target(args.output, input_path, preset, spec)
     max_new_tokens = args.max_new_tokens or preset.max_new_tokens
 
@@ -541,7 +547,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     plan = engine.plan_run(config, texts, store)
     model_text = spec.label
-    if not spec.is_demo:
+    if spec.is_api:
+        model_text += f" ({spec.provider_label} API)"
+    elif not spec.is_demo:
         model_text += f" ({backend_base.PRECISION_LABELS.get(config.precision, config.precision)})"
     header = (
         f"{preset.title} | {model_text} | {_count(len(texts), 'row')} of {_source_text(table)}, "
@@ -550,6 +558,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if plan.n_todo_unique:
         header += f" | {args.order} texts first"
     _err(header)
+    if spec.is_api and plan.n_todo_unique:
+        _err(
+            f"note: {_count(plan.n_todo_unique, 'text')} will be sent to {spec.provider_label} "
+            f"({args.batch_size} requests at a time)."
+        )
     if plan.n_truncated_rows:
         _err(
             f"note: {_count(plan.n_truncated_rows, 'text')} longer than "
@@ -841,7 +854,7 @@ def _resolve_model(name: str) -> ModelSpec:
     spec = model_catalogue.find_model(value)
     if spec is not None:
         return spec
-    known = model_catalogue.available_models(include_demo=True)
+    known = [*model_catalogue.available_models(include_demo=True), *model_catalogue.api_models()]
     folded = value.casefold()
     for spec in known:
         if folded in (spec.label.casefold(), spec.repo.casefold()):
@@ -851,7 +864,9 @@ def _resolve_model(name: str) -> ModelSpec:
             found = model_catalogue.find_model(repo)
             if found is not None:
                 return found
-    looks_like_path_or_repo = "/" in value or "\\" in value or value.startswith(("demo://", "."))
+    looks_like_path_or_repo = (
+        "/" in value or "\\" in value or ":" in value or value.startswith(("demo://", "."))
+    )
     if not looks_like_path_or_repo and not _is_dir(value):
         # A bare name is a valid (namespace-less) repo id, but far more often a
         # typo of a built-in model; loading would fail only after a download.
@@ -1144,6 +1159,12 @@ def _timing(result: engine.RunResult) -> str:
     generating = stats.elapsed_s - stats.load_s
     if stats.generated and generating > 0:
         text += f", {_rate(stats.generated / generating)}"
+    if stats.input_tokens or stats.output_tokens:
+        text += f"; {stats.input_tokens:,} input and {stats.output_tokens:,} output tokens"
+        spec = model_catalogue.find_model(result.config.model_id)
+        if spec is not None and spec.price:
+            cost = (stats.input_tokens * spec.price[0] + stats.output_tokens * spec.price[1]) / 1e6
+            text += f" (about ${cost:,.2f} at list prices)"
     return text + "."
 
 
@@ -1206,11 +1227,35 @@ def _cmd_models(args: argparse.Namespace) -> int:
         rows.append([spec.label, spec.size_label or "-", spec.repo, ", ".join(notes)])
     _out(_format_table(["MODEL", "SIZE", "REPO", "NOTES"], rows, "lrll"))
     _out("")
+    cloud = [
+        [
+            spec.label,
+            spec.provider_label,
+            spec.repo,
+            _list_price(spec.price) if spec.price else "-",
+            spec.tier,
+        ]
+        for spec in model_catalogue.api_models()
+    ]
+    _out(
+        _format_table(["CLOUD MODEL", "PROVIDER", "--model", "LIST PRICE", "NOTES"], cloud, "lllll")
+    )
+    _out("")
     _out(
         "--model takes the name, the repo id, a version-1 name, any other Hugging Face "
         "repo id, or a local model folder. Every built-in model fits an 8 GB GPU at 4-bit."
     )
+    _out(
+        "Cloud models run on the provider's servers - the texts are sent to them - and need "
+        "ANTHROPIC_API_KEY or OPENAI_API_KEY. Any other cloud model works as "
+        "anthropic:<model id> or openai:<model id>. List prices are per million input / "
+        f"output tokens, as of {model_catalogue.PRICES_AS_OF}."
+    )
     return EXIT_OK
+
+
+def _list_price(price: tuple[float, float]) -> str:
+    return f"${price[0]:,.2f} / ${price[1]:,.2f}"
 
 
 def _answers(preset: Preset) -> str:
