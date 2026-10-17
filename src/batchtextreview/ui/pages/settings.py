@@ -40,7 +40,6 @@ _K_RUN_DELETED = "settings.run_deleted"
 _K_RUN_MSG = "settings.run_msg"
 K_KEY_INPUT = "settings.api_key"
 """Prefix of each provider's key input (``settings.api_key::anthropic``)."""
-K_KEY_FORM = "settings.api_key_form"
 _K_KEY_MSG = "settings.api_key_msg"
 """Prefix of each provider's last key action / connection test result."""
 
@@ -224,8 +223,8 @@ def device_note(device: DeviceInfo, demo: bool) -> tuple[str, str, str] | None:
     if device.kind == "none":
         return (
             "PyTorch isn't installed",
-            "Only the demo model can run. Install PyTorch and transformers (see the README) "
-            "to run real models. " + demo_hint,
+            "Local models need PyTorch and transformers (see the README). Cloud models "
+            "(Anthropic, OpenAI) run without them. " + demo_hint,
             "info" if demo else "warning",
         )
     if device.kind == "cpu":
@@ -478,9 +477,12 @@ def _provider_card(provider: str) -> None:
         found = api_keys.lookup(provider)
         if found is not None:
             st.caption(f"Key in use: `{api_keys.masked(found[0])}`")
-        base_url = os.environ.get("OPENAI_BASE_URL", "").strip() if provider == "openai" else ""
+        base_url = api_keys.base_url(provider)
         if base_url:
-            st.caption(f"Requests go to {fmt.md(base_url)} (OPENAI_BASE_URL), not to OpenAI.")
+            st.caption(
+                f"Requests go to {fmt.md(base_url)} ({api_keys.BASE_URL_VARS[provider]}), "
+                f"not to {name}."
+            )
         installed = api.sdk_installed(provider)
         if not installed:
             st.warning(
@@ -490,28 +492,37 @@ def _provider_card(provider: str) -> None:
             )
 
         can_save = api_keys.keyring_available()
-        with st.form(f"{K_KEY_FORM}::{provider}", border=False, clear_on_submit=True):
-            key = st.text_input(
-                f"{name} API key",
-                type="password",
-                key=f"{K_KEY_INPUT}::{provider}",
-                placeholder="sk-ant-…" if provider == "anthropic" else "sk-…",
-                help=f"Instead of {env_var}. A key entered here is used before {env_var}.",
+        # Buttons with callbacks, not a form: the callback empties the field,
+        # so the typed key doesn't linger in the session state.
+        st.text_input(
+            f"{name} API key",
+            type="password",
+            key=f"{K_KEY_INPUT}::{provider}",
+            placeholder="sk-ant-…" if provider == "anthropic" else "sk-…",
+            help=f"“Use for this session” comes before {env_var}; a saved key is used "
+            f"only when {env_var} isn't set.",
+        )
+        with st.container(horizontal=True, gap="small"):
+            st.button(
+                "Use for this session",
+                key=f"settings.api_use::{provider}",
+                icon=":material/login:",
+                on_click=_use_typed_key,
+                args=(provider, False),
+                help="Until the app stops, for every browser tab of this app.",
             )
-            with st.container(horizontal=True, gap="small"):
-                use = st.form_submit_button("Use for this session", icon=":material/login:")
-                save = st.form_submit_button(
-                    "Save",
-                    icon=":material/save:",
-                    disabled=not can_save,
-                    help=f"Saves the key in {keyring_name()}, so later sessions use it too."
-                    if can_save
-                    else "No system keyring is available here: set "
-                    f"{env_var} instead, or install the keyring package.",
-                )
-        if use or save:
-            _store_key(provider, key, save=bool(save))
-            st.rerun()  # the status above was drawn before the key changed
+            st.button(
+                "Save",
+                key=f"settings.api_save::{provider}",
+                icon=":material/save:",
+                disabled=not can_save,
+                on_click=_use_typed_key,
+                args=(provider, True),
+                help=f"Saves the key in {keyring_name()}, so later sessions use it too."
+                if can_save
+                else "No system keyring is available here: set "
+                f"{env_var} instead, or install the keyring package.",
+            )
 
         source = found[1] if found is not None else None
         with st.container(horizontal=True, gap="small"):
@@ -540,13 +551,19 @@ def _provider_card(provider: str) -> None:
                 type="tertiary",
                 help=f"Deletes the key saved in {keyring_name()}.",
             ):
-                api_keys.delete_saved_key(provider)
-                _set_key_message(provider, "info", "The saved key is removed.")
+                try:
+                    api_keys.delete_saved_key(provider)
+                except RuntimeError as exc:
+                    _set_key_message(provider, "error", str(exc))
+                else:
+                    _set_key_message(provider, "info", "The saved key is removed.")
                 st.rerun()
         message = st.session_state.get(f"{_K_KEY_MSG}::{provider}")
         if message:
             kind, text = message
-            {"success": st.success, "error": st.error}.get(kind, st.info)(text)
+            {"success": st.success, "error": st.error, "warning": st.warning}.get(kind, st.info)(
+                text
+            )
         builtin = models.api_models(provider)
         if builtin:
             st.caption(
@@ -558,6 +575,14 @@ def _provider_card(provider: str) -> None:
                 + f". Any other model works as {provider}:<model id> through “Custom model…” "
                 "on the Run page."
             )
+
+
+def _use_typed_key(provider: str, save: bool) -> None:
+    """Button callback: use or save the key typed in, then empty the field."""
+    field = f"{K_KEY_INPUT}::{provider}"
+    typed = str(st.session_state.get(field) or "")
+    st.session_state[field] = ""
+    _store_key(provider, typed, save=save)
 
 
 def _store_key(provider: str, key: str, *, save: bool) -> None:
@@ -573,7 +598,16 @@ def _store_key(provider: str, key: str, *, save: bool) -> None:
             return
         # A session key would hide the one just saved.
         api_keys.set_session_key(provider, None)
-        _set_key_message(provider, "success", f"Saved in {keyring_name()}.")
+        env_var = api_keys.ENV_VARS[provider]
+        if os.environ.get(env_var, "").strip():
+            _set_key_message(
+                provider,
+                "warning",
+                f"Saved in {keyring_name()}, but {env_var} is set and is used first. Unset it "
+                "and restart the app to use the saved key.",
+            )
+        else:
+            _set_key_message(provider, "success", f"Saved in {keyring_name()}.")
     else:
         api_keys.set_session_key(provider, value)
         _set_key_message(provider, "success", "Used until the app stops.")

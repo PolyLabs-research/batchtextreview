@@ -487,9 +487,8 @@ def no_api_keys(monkeypatch):
 
 
 def _form_button(at: AppTest, label: str, provider: str):
-    return next(
-        b for b in at.button if b.label == label and f"api_key_form::{provider}" in str(b.key)
-    )
+    action = {"Use for this session": "use", "Save": "save"}[label]
+    return at.button(key=f"settings.api_{action}::{provider}")
 
 
 def test_cloud_models_section_without_keys(no_api_keys):

@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import pandas as pd
 import streamlit as st
 
-from batchtextreview import data, engine, models, presets, prompting
+from batchtextreview import api_keys, data, engine, models, presets, prompting
 from batchtextreview.backends.base import PRECISION_LABELS, resolve_precision
 from batchtextreview.labels import is_missing, normalise_label
 from batchtextreview.ui import analysis, components, nav, resources, state
@@ -106,8 +106,9 @@ _SOURCE_LABELS = {"upload": "Upload", "path": "From a folder", "sample": "Sample
 _SCOPE_LABELS = {"all": "All", "first": "First rows", "random": "Random sample"}
 _PRECISION_CHOICES = ("auto", "4bit", "fp16", "fp32")
 API_CONSENT_KEY = "run.api_consent"
-"""Prefix of the per-provider "send these texts to <provider>" checkbox (one
-per browser session: never remembered across sessions)."""
+"""Prefix of the "Send these texts to <provider>" checkbox. Its key also
+holds the recipient and which texts (dataset, column, rows), so a tick never
+carries over to other data; it is never remembered across sessions."""
 CHARS_PER_TOKEN = 4
 """Rough characters per token for the Run page's cost estimate (English
 text; other languages, and code, use more tokens)."""
@@ -1333,7 +1334,11 @@ def _plan_settings(
         and not str(last).startswith("demo://")
         and _safe(lambda: models.custom_model(str(last)), None) is not None
     )
-    _init(MODEL_KEY, last if last in by_repo else _CUSTOM_MODEL if restore_custom else options[0])
+    default = options[0]
+    if not device.has_torch and not settings.demo_mode:
+        # A cloud-only install: start on a cloud model that can run.
+        default = _first_runnable_cloud_model(options) or default
+    _init(MODEL_KEY, last if last in by_repo else _CUSTOM_MODEL if restore_custom else default)
     _ensure_option(MODEL_KEY, options, options[0])
     choice = st.selectbox(
         "Model",
@@ -1503,6 +1508,20 @@ def _plan_settings(
     return chosen, selection
 
 
+def _first_runnable_cloud_model(options: list[str]) -> str | None:
+    """The first built-in cloud model in ``options`` whose SDK is installed
+    and whose provider has credentials (else just an installed SDK)."""
+    from batchtextreview.backends import api
+
+    cloud = [o for o in options if models.api_provider(o)]
+    ready = [
+        o for o in cloud if api.setup_problem(models.api_provider(o) or "", in_app=True) is None
+    ]
+    installed = [o for o in cloud if api.sdk_installed(models.api_provider(o) or "")]
+    found = ready or installed
+    return found[0] if found else None
+
+
 def remembered_order(store: Store) -> str:
     """The processing order chosen last (in any session), or
     ``engine.DEFAULT_ORDER`` when none was chosen or the stored value isn't
@@ -1614,10 +1633,13 @@ def _plan_summary_and_button(
         _discard_button(store, config, f"{spec.label} · {task.preset.title}")
 
     problem = _first_problem(data_step, task, plan_settings, plan, device, jobs.active())
-    if spec is not None and spec.is_api and plan is not None and config is not None:
-        consent = _cloud_notice(spec, plan, config)
-        if problem is None and plan.n_todo_rows and not consent:
-            problem = f"Tick “Send these texts to {spec.provider_label}” to run a cloud model."
+    sends = plan is None or plan.n_todo_rows > 0
+    cloud_ok = True
+    if spec is not None and spec.is_api and config is not None and selection is not None:
+        cloud_ok = _cloud_notice(spec, plan, config, consent_key(spec, data_step, selection))
+        if problem is None and sends and not cloud_ok:
+            who = api_keys.recipient(spec.provider or "")
+            problem = f"Tick “Send these texts to {who}” to run a cloud model."
     existing = _same_finished_job(jobs) if plan is not None and plan.fully_cached else None
     if existing is not None and problem is None:
         # The very same run finished in this session: open it rather than
@@ -1658,37 +1680,74 @@ def _plan_summary_and_button(
         for warning in data_step.warnings:
             st.caption(f":orange[:material/warning:] {warning}")
     if clicked and problem is None and config is not None and selection is not None:
-        _submit(store, jobs, config, texts, data_step, task, selection, plan_settings, exact)
+        _submit(
+            store,
+            jobs,
+            config,
+            texts,
+            data_step,
+            task,
+            selection,
+            plan_settings,
+            exact,
+            cloud_ok=cloud_ok or not sends,
+        )
     return None
 
 
-def _cloud_notice(spec: models.ModelSpec, plan: engine.RunPlan, config: engine.RunConfig) -> bool:
+def consent_key(spec: models.ModelSpec, data_step: _DataStep, selection: _Selection) -> str:
+    """The "Send these texts to …" checkbox's key: one per recipient and
+    set of texts, so ticking it for one file doesn't send another."""
+    provider = spec.provider or ""
+    ds = data_step.ds
+    which = [
+        api_keys.recipient(provider),
+        ds.fingerprint if ds is not None else "",
+        data_step.text_col or "",
+        selection.mode,
+        selection.n,
+    ]
+    digest = hashlib.sha256(repr(which).encode("utf-8")).hexdigest()[:12]
+    return f"{API_CONSENT_KEY}::{provider}::{digest}"
+
+
+def _cloud_notice(
+    spec: models.ModelSpec, plan: engine.RunPlan | None, config: engine.RunConfig, key: str
+) -> bool:
     """What a cloud model run sends and roughly costs, and the checkbox
     that agrees to send it. True when ticked (or when nothing is sent)."""
-    if not plan.n_todo_rows:
+    if plan is not None and not plan.n_todo_rows:
         return True
-    provider = spec.provider_label
-    calls, sent, answers = api_usage_estimate(plan, config)
-    words = (
-        f"Sends {fmt.plural(calls, 'text')} to {provider}: about "
-        f"{fmt.token_count(sent)} input tokens, and answers of up to "
-        f"{fmt.plural(config.max_new_tokens, 'token')} each"
-    )
-    if spec.price:
-        cost = (sent * spec.price[0] + answers * spec.price[1]) / 1e6
-        words += (
-            f" · at most about {fmt.no_math(fmt.money(cost))} at list prices "
-            f"({models.PRICES_AS_OF}), "
-            "plus any reasoning"
+    who = api_keys.recipient(spec.provider or "")
+    if plan is None:
+        words = f"The texts to generate will be sent to {fmt.md(who)}"
+    else:
+        calls, sent, answers = api_usage_estimate(plan, config)
+        words = (
+            f"Sends {fmt.plural(calls, 'text')} to {fmt.md(who)}: about "
+            f"{fmt.token_count(sent)} input tokens, and answers of up to "
+            f"{fmt.plural(config.max_new_tokens, 'token')} each"
         )
+        if spec.price:
+            cost = (sent * spec.price[0] + answers * spec.price[1]) / 1e6
+            amount = "under $0.01" if cost < 0.01 else f"about {fmt.money(cost)}"
+            words += (
+                f" · {fmt.no_math(amount)} at list prices ({models.PRICES_AS_OF}), "
+                "plus any reasoning"
+            )
     st.caption(f":material/cloud_upload: {words}.")
+    where = (
+        f"{spec.provider_label}'s servers"
+        if who == spec.provider_label
+        else f"{who}, set with {api_keys.BASE_URL_VARS[spec.provider or 'openai']}"
+    )
     return bool(
         st.checkbox(
-            f"Send these texts to {provider}",
-            key=f"{API_CONSENT_KEY}::{spec.provider}",
-            help=f"Cloud models run on {provider}'s servers: each text is sent to {provider} "
-            "over the internet and handled under your API account's terms. Only send data "
-            "you're allowed to share with them. Asked once per browser session.",
+            f"Send these texts to {who}",
+            key=key,
+            help=f"Cloud models run on {where}: each text is sent there over the internet and "
+            "handled under your API account's terms. Only send data you're allowed to share. "
+            "Asked again for other data.",
         )
     )
 
@@ -1843,8 +1902,9 @@ def model_problem(spec: models.ModelSpec, precision: str, device: DeviceInfo) ->
         return api_model_problem(spec)
     if not device.has_torch:
         return (
-            "PyTorch isn't installed, so only the demo model can run. "
-            "Install it as described in the README, then restart the app."
+            "PyTorch isn't installed, so local models can't run here. Choose a cloud model "
+            "(Anthropic or OpenAI), or install PyTorch as the README describes and restart "
+            "the app."
         )
     if precision == "4bit" and not (device.kind == "cuda" and device.bitsandbytes):
         better = "fp16" if device.kind in ("cuda", "mps") else "fp32"
@@ -1902,12 +1962,19 @@ def _submit(
     selection: _Selection,
     plan_settings: _PlanSettings,
     exact: bool,
+    *,
+    cloud_ok: bool,
 ) -> None:
+    """Start the run. ``cloud_ok``: a cloud model may be sent these texts
+    (the tick is on, or nothing would be sent)."""
     from batchtextreview.jobs import JobBusyError, JobRequest
 
     assert data_step.ds is not None and data_step.text_col is not None
     spec = plan_settings.model
     assert spec is not None
+    if spec.is_api and not cloud_ok:  # the button is disabled then; never send unasked
+        st.error("Tick “Send these texts” first: nothing was sent.", icon=":material/block:")
+        return
     frame = selection.frame.reset_index(drop=True)
     exclude = tuple(c for c in (data_step.text_col, data_step.id_col, data_step.gold_col) if c)
     context = state.RunContext(
@@ -1934,6 +2001,7 @@ def _submit(
             "precision_requested": plan_settings.precision,
             "data_source": data_step.ds.origin,
             "suggested_max_new_tokens": task.preset.max_new_tokens,
+            "recipient": api_keys.recipient(spec.provider) if spec.provider else None,
         },
     )
     request = JobRequest(

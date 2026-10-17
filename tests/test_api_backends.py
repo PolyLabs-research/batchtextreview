@@ -519,7 +519,7 @@ class MemoryKeyring:
 
 
 @pytest.fixture
-def memory_keyring(monkeypatch):
+def memory_keyring(monkeypatch, real_keyring_lookup):
     keyring = pytest.importorskip("keyring")
     previous = keyring.get_keyring()
     memory = MemoryKeyring()
@@ -623,3 +623,244 @@ def test_run_config_of_an_api_model_has_no_precision():
     assert spec is not None
     config = RunConfig.build(spec, "Q: {text}", 8, precision="4bit")
     assert config.precision == "none" and config.model_revision == ""
+
+
+# ---------------------------------------------------------------------------
+# Review fixes
+# ---------------------------------------------------------------------------
+
+
+class _Fake:
+    """A cloud backend stand-in that remembers the key it was made with."""
+
+    def __init__(self, model_id: str, key: str | None) -> None:
+        self.model_id, self.precision, self.key, self.closed = model_id, "none", key, False
+
+    def generate(self, prompts, max_new_tokens):
+        return ["x"] * len(prompts)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_manager_reconnects_when_the_key_changes_and_keeps_the_local_model():
+    made: list[_Fake] = []
+
+    def factory(model_id: str, precision: str) -> Any:
+        backend = _Fake(model_id, api_keys.get_key("openai"))
+        made.append(backend)
+        return backend
+
+    manager = manager_module.ModelManager(factory)
+    with manager.acquire("Qwen/Qwen2.5-1.5B-Instruct", "4bit") as local:
+        pass
+    api_keys.set_session_key("openai", "sk-personal")
+    with manager.acquire("openai:gpt-6-luna", "none") as first:
+        assert first.key == "sk-personal"
+    with manager.acquire("openai:gpt-6-luna", "none") as again:
+        assert again is first  # same key: reused
+    api_keys.set_session_key("openai", "sk-company")
+    assert not manager.is_loaded("openai:gpt-6-luna", "none")
+    with manager.acquire("openai:gpt-6-luna", "none") as second:
+        assert second is not first and second.key == "sk-company" and first.closed
+    # The local model was never evicted, and "loaded" only names it.
+    assert manager.loaded == ("Qwen/Qwen2.5-1.5B-Instruct", "4bit") and not local.closed
+    second.closed = True  # e.g. Ctrl+C closed it: a new client next time
+    with manager.acquire("openai:gpt-6-luna", "none") as third:
+        assert third is not second
+    manager.unload()
+    assert third.closed and local.closed and manager.loaded is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"message": "max_completion_tokens is too large: 34816.", "param": "max_completion_tokens",
+         "code": "invalid_value"},
+        {"message": "'max_tokens' or 'max_completion_tokens' is too large: the context is 4096."},
+        {"message": "temperature must be at most 2.", "param": "temperature", "code": "invalid_value"},
+    ],
+)  # fmt: skip
+def test_openai_keeps_its_settings_after_errors_that_are_not_unsupported(error):
+    def chat(body):
+        if body["messages"][0]["content"] == "bad":
+            return httpx2.Response(400, json={"error": {"type": "invalid_request_error", **error}})
+        return _completion()
+
+    server = OpenAIServer(chat)
+    backend = openai_backend(server)
+    backend.generate(["bad"], 8)
+    assert backend.last_row_errors[0] and "rejected the request" in backend.last_row_errors[0]
+    assert backend._settings() == ("none", True, "max_completion_tokens", False)
+    assert backend.generate(["fine"], 8) == ["positive"]
+
+
+def test_openai_sends_no_reasoning_effort_to_another_server(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+    server = OpenAIServer(lambda body: _completion())
+    backend = openai_backend(server, "my-local-model")
+    backend.generate(["a"], 8)
+    request = server.completions[-1]
+    assert "reasoning_effort" not in request and request["max_completion_tokens"] == 8
+
+
+def test_out_of_credit_is_fatal():
+    def chat(body):
+        return _error(429, "You exceeded your current quota.", code="insufficient_quota")
+
+    with pytest.raises(GenerationError, match="out of credit") as caught:
+        openai_backend(OpenAIServer(chat)).generate(["a", "b"], 8)
+    assert caught.value.fatal
+
+    def messages(body):
+        return httpx2.Response(
+            400,
+            json={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "Your credit balance is too low to access the Anthropic API.",
+                },
+            },
+        )
+
+    with pytest.raises(GenerationError, match="out of credit"):
+        anthropic_backend(AnthropicServer(messages, _capabilities())).generate(["a"], 8)
+
+
+def anthropic_model(server: AnthropicServer, model: str) -> api.AnthropicBackend:
+    client = anthropic.Anthropic(
+        api_key="sk-ant-test",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(server)),
+        max_retries=0,
+    )
+    return api.AnthropicBackend(f"anthropic:{model}", client=client)
+
+
+def test_anthropic_headroom_only_for_models_that_think():
+    server = AnthropicServer(lambda body: _message(), _capabilities())
+    anthropic_model(server, "claude-opus-4-8").generate(["a"], 8)
+    assert server.requests[-1]["max_tokens"] == 8  # 4.x models don't think unless asked
+    anthropic_model(server, "claude-opus-5-5").generate(["a"], 8)
+    assert server.requests[-1]["max_tokens"] == 8 + api.REASONING_HEADROOM
+
+
+def test_anthropic_adds_headroom_once_thinking_used_up_the_limit():
+    def messages(body):
+        if body["max_tokens"] <= 8:
+            return _message(text=None, stop="max_tokens")  # a thinking block, no text
+        return _message()
+
+    server = AnthropicServer(messages, _capabilities())
+    backend = anthropic_model(server, "claude-sonnet-4-6")
+    assert backend.generate(["a"], 8) == ["negative"]
+    assert [r["max_tokens"] for r in server.requests] == [8, 8 + api.REASONING_HEADROOM]
+
+
+def test_anthropic_budget_never_exceeds_the_models_output_limit():
+    class Small(AnthropicServer):
+        def __call__(self, request):
+            response = super().__call__(request)
+            if request.method == "GET":
+                info = json.loads(response.content)
+                info["max_tokens"] = 1000
+                return httpx2.Response(200, json=info)
+            return response
+
+    server = Small(lambda body: _message(), _capabilities())
+    anthropic_model(server, "claude-haiku-5-5").generate(["a"], 8)
+    assert server.requests[-1]["max_tokens"] == 1000
+
+
+def test_ctrl_c_closes_the_client_instead_of_waiting():
+    backend = openai_backend(OpenAIServer(lambda body: _completion()))
+
+    def interrupted(prompt, max_new_tokens):
+        raise KeyboardInterrupt
+
+    backend._ask = interrupted  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        backend.generate(["a", "b", "c"], 8)
+    assert backend.closed
+
+
+def test_recipient_and_fingerprint(monkeypatch):
+    assert api_keys.recipient("openai") == "OpenAI"
+    before = api_keys.fingerprint("openai")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example.com/v1")
+    assert api_keys.recipient("openai") == "gateway.example.com"
+    assert api_keys.fingerprint("openai") != before
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "llm-proxy.internal:8443")
+    assert api_keys.recipient("anthropic") == "llm-proxy.internal:8443"
+    key_less = api_keys.fingerprint("anthropic")
+    api_keys.set_session_key("anthropic", "sk-ant-x")
+    assert api_keys.fingerprint("anthropic") != key_less
+    assert "sk-ant-x" not in api_keys.fingerprint("anthropic")
+
+
+def test_a_failed_keyring_read_is_tried_again(monkeypatch, memory_keyring):
+    memory_keyring.store[(api_keys.KEYRING_SERVICE, "openai")] = "sk-saved"
+    calls = {"n": 0}
+    real_get = memory_keyring.get_password
+
+    def locked_once(service, name):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("keyring is locked")
+        return real_get(service, name)
+
+    monkeypatch.setattr(memory_keyring, "get_password", locked_once)
+    assert api_keys.saved_key("openai") is None  # locked: not remembered
+    assert api_keys.saved_key("openai") == "sk-saved"
+
+
+def test_a_refused_removal_is_reported(monkeypatch, memory_keyring):
+    api_keys.save_key("anthropic", "sk-ant-saved")
+
+    def refuse(service, name):
+        raise RuntimeError("access denied")
+
+    monkeypatch.setattr(memory_keyring, "delete_password", refuse)
+    with pytest.raises(RuntimeError, match="Couldn't remove the saved key"):
+        api_keys.delete_saved_key("anthropic")
+
+
+def test_plaintext_keyrings_are_not_offered(real_keyring_lookup, monkeypatch):
+    keyring = pytest.importorskip("keyring")
+
+    class Plaintext:  # what keyrings.alt's file backend looks like
+        pass
+
+    Plaintext.__module__ = "keyrings.alt.file"
+    monkeypatch.setattr(keyring, "get_keyring", lambda: Plaintext())
+    assert not api_keys.keyring_available()
+
+
+def test_masked_short_keys_show_little():
+    assert api_keys.masked("abcdefghijklm") == "…jklm"
+    assert api_keys.masked("sk-ant-api03-abcdefghijklmnop1234") == "sk-ant-…1234"
+
+
+def test_cloud_batches_ignore_the_character_budget():
+    from batchtextreview import engine
+
+    calls: list[int] = []
+
+    class Counting(_Fake):
+        def generate(self, prompts, max_new_tokens):
+            calls.append(len(prompts))
+            return ["x"] * len(prompts)
+
+    class Manager:
+        import contextlib
+
+        @contextlib.contextmanager
+        def acquire(self, model_id, precision):
+            yield Counting(model_id, None)
+
+    spec = models.find_model("openai:gpt-6-luna")
+    assert spec is not None
+    config = engine.RunConfig.build(spec, "Q: {text}", 4)
+    texts = [f"{i} " + "y" * 3000 for i in range(10)]
+    engine.execute_run(config, texts, store=None, manager=Manager(), batch_size=8)
+    assert calls == [8, 2]  # 24,000 characters in a batch: fine for an API

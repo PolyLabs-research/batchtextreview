@@ -1,10 +1,13 @@
 """Process-wide model holder.
 
-At most one model lives in memory at a time - switching models frees the old
-one first, which matters on an 8 GB card where two 7B models won't co-exist.
-All generation goes through :meth:`ModelManager.acquire`, which serialises
-access with a lock, so two browser sessions can't run the GPU at once or swap
-the model out from under each other.
+At most one local model lives in memory at a time - switching models frees
+the old one first, which matters on an 8 GB card where two 7B models won't
+co-exist. Cloud API models hold no weights: their clients are kept apart
+(:attr:`ModelManager.loaded` never names one), so running one doesn't evict
+the local model, and a client is made again when the key or server it was
+made with changes. All generation goes through :meth:`ModelManager.acquire`,
+which serialises access with a lock, so two browser sessions can't run the
+GPU at once or swap the model out from under each other.
 """
 
 from __future__ import annotations
@@ -57,17 +60,25 @@ class ModelManager:
         self._loaded: tuple[str, str] | None = None
         self._revision = ""
         """``models.model_revision`` of the loaded model when it was loaded."""
+        self._api: dict[str, tuple[Backend, str]] = {}
+        """Cloud model id -> (its backend, ``api_keys.fingerprint`` of the
+        credentials it was made with)."""
         self._holders = 0
 
     @property
     def loaded(self) -> tuple[str, str] | None:
-        """(model_id, precision) of the loaded model, or None."""
+        """(model_id, precision) of the loaded local model, or None."""
         return self._loaded
 
     def is_loaded(self, model_id: str, precision: str) -> bool:
         """True if :meth:`acquire` would reuse the loaded model: it is this
         (model_id, precision) and, for a local folder, the folder's files
-        haven't changed since it was loaded."""
+        haven't changed since it was loaded (for a cloud model: the key and
+        server haven't changed)."""
+        provider = api_provider(model_id)
+        if provider:
+            held = self._api.get(model_id)
+            return held is not None and held[1] == _credentials(provider)
         return (
             self._backend is not None
             and self._loaded == (model_id, precision)
@@ -101,8 +112,10 @@ class ModelManager:
                 self._holders -= 1
 
     def unload(self) -> bool:
-        """Free the loaded model (waits for the lock). True if one was loaded."""
+        """Free the loaded local model and close any cloud clients (waits
+        for the lock). True if a local model was loaded."""
         with self._lock:
+            self._close_api()
             return self._release()
 
     # ------------------------------------------------------------------
@@ -110,6 +123,9 @@ class ModelManager:
     # ------------------------------------------------------------------
 
     def _ensure_loaded(self, model_id: str, precision: str) -> Backend:
+        provider = api_provider(model_id)
+        if provider:
+            return self._ensure_api(model_id, precision, provider)
         key = (model_id, precision)
         # Taken before loading: if the folder changes during the load, the
         # next acquire sees a mismatch and loads again (never the reverse).
@@ -129,6 +145,25 @@ class ModelManager:
         self._backend, self._loaded, self._revision = backend, key, revision
         return backend
 
+    def _ensure_api(self, model_id: str, precision: str, provider: str) -> Backend:
+        credentials = _credentials(provider)
+        held = self._api.pop(model_id, None)
+        if held is not None:
+            if held[1] == credentials and not getattr(held[0], "closed", False):
+                self._api[model_id] = held
+                return held[0]
+            _log.info("The %s key or server changed - connecting %s again", provider, model_id)
+            _close(held[0])
+        _log.info("Connecting to %s (%s)", model_id, provider)
+        backend = self._factory(model_id, precision)
+        self._api[model_id] = (backend, credentials)
+        return backend
+
+    def _close_api(self) -> None:
+        held, self._api = list(self._api.values()), {}
+        for backend, _ in held:
+            _close(backend)
+
     def _release(self) -> bool:
         """Forget, close and free the current backend. True if there was one."""
         backend = self._backend
@@ -145,6 +180,19 @@ class ModelManager:
         del backend
         _free_accelerator_memory()
         return True
+
+
+def _credentials(provider: str) -> str:
+    from batchtextreview import api_keys
+
+    return api_keys.fingerprint(provider)
+
+
+def _close(backend: Backend) -> None:
+    try:
+        backend.close()
+    except Exception:
+        _log.warning("Error while closing %s", getattr(backend, "model_id", "?"), exc_info=True)
 
 
 def _free_accelerator_memory() -> None:

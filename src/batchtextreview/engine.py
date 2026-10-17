@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import math
+import sys
 import threading
 import time
 from collections import deque
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from batchtextreview import labels, prompting
 from batchtextreview.backends.base import BackendError
+from batchtextreview.models import api_provider
 
 if TYPE_CHECKING:
     from batchtextreview.backends.manager import ModelManager
@@ -704,6 +706,10 @@ class _Run:
         longest_first = order == "longest"
         ordered = sorted(self.todo, key=lambda k: len(plan.snippets[k]), reverse=longest_first)
         lengths = {k: len(plan.snippets[k]) for k in ordered}
+        if api_provider(config.model_id):
+            # One request per text: the character budget guards GPU memory,
+            # which a cloud model doesn't use, so the batch size alone counts.
+            max_batch_chars = sys.maxsize
         batches = pack_batches(ordered, lengths, batch_size, max_batch_chars)
         # Prompt characters per key and per batch (render_prompt is a plain
         # replace); the former also prices a failed batch's single retries.

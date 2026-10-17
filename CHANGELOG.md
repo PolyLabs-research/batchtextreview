@@ -13,17 +13,19 @@ All notable changes to this project are documented here. The format follows
   and Opus 5.5, and GPT-6 Luna, GPT-6.1 Sol and GPT-6 Astra. Any other model works as
   `anthropic:<model id>` or `openai:<model id>`, and so do OpenAI-compatible servers
   (`OPENAI_BASE_URL`). Install the SDKs with `pip install -e ".[api]"`.
-  - **Before a run**, the Run page shows how many texts go to the provider, about how many tokens,
-    and the most it should cost at list prices. A "Send these texts to …" tick, asked once per
-    browser session, is needed before anything is sent.
-  - **API keys** come from the session, then `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, then the
-    system keyring. Manage them under **Models & settings → Cloud models**, which also has a
-    connection test. Keys are never stored in the results database or the log.
+  - **Before a run**, the Run page shows how many texts go to the provider and about how many
+    tokens, and for Claude models the approximate cost at list prices. A "Send these texts to …"
+    tick is needed before anything is sent, and is asked again for other data or another
+    provider.
+  - **API keys** come from the app (kept in memory until it stops), then `ANTHROPIC_API_KEY` /
+    `OPENAI_API_KEY`, then the system keyring. Manage them under **Models & settings → Cloud
+    models**, which also has a connection test. Keys are never stored in the results database or
+    the log.
   - **Each text is one request.** A batch's texts are sent at once (the batch size), with the
     SDKs' retries. A text the provider refuses or rejects fails on its own, and the rest of its
-    batch is kept. A rejected key stops the run at once.
-  - **Token counts** and the list-price cost appear in Results → Details and at the end of a
-    command-line run.
+    batch is kept. A rejected key, or an account out of credit, stops the run at once.
+  - **Token counts**, and the list-price cost where the price is known, appear in Results →
+    Details and at the end of a command-line run.
 - `engine.RunStats.input_tokens` / `output_tokens`, and the optional backend attributes
   `last_row_errors` and `last_usage`. `GenerationError(fatal=True)` stops a run without retrying
   its rows.

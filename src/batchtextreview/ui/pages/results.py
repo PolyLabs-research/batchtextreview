@@ -1886,7 +1886,8 @@ def _details_tab(job: Job, snap: JobSnapshot, built: an.JobAnalysis) -> None:
     with model_col:
         provider = models.API_PROVIDERS.get(models.api_provider(cfg.model_id) or "")
         if provider:  # a cloud model: the same number of rows, so the cards line up
-            weights = ("Runs on", f"{provider}'s servers")
+            who = ctx.extra.get("recipient") or provider
+            weights = ("Runs on", f"{provider}'s servers" if who == provider else text(who))
             batch = ("Requests at once", f"{request.batch_size:,}")
             used = tokens_used(stats, models.find_model(cfg.model_id))
             last = ("Tokens used", fmt.no_math(used))

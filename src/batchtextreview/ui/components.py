@@ -250,16 +250,27 @@ def key_status(provider: str) -> tuple[bool, str]:
 
 
 def _api_badges(spec: ModelSpec) -> None:
+    from batchtextreview import api_keys
     from batchtextreview.models import PRICES_AS_OF
 
     provider = spec.provider_label
-    st.badge(
-        f"{provider} API",
-        icon=":material/cloud:",
-        color="blue",
-        help=f"Runs on {provider}'s servers: the texts you run are sent to {provider}, "
-        "and the requests are billed to your API account.",
-    )
+    who = api_keys.recipient(spec.provider or "")
+    if who == provider:
+        st.badge(
+            f"{provider} API",
+            icon=":material/cloud:",
+            color="blue",
+            help=f"Runs on {provider}'s servers: the texts you run are sent to {provider}, "
+            "and the requests are billed to your API account.",
+        )
+    else:
+        variable = api_keys.BASE_URL_VARS[spec.provider or "openai"]
+        st.badge(
+            f"{provider} API · {fmt.md(who)}",
+            icon=":material/cloud:",
+            color="violet",
+            help=f"{variable} is set: the texts you run are sent to {who}, not to {provider}.",
+        )
     if spec.tier:
         st.badge(spec.tier.capitalize(), icon=":material/speed:", color="blue")
     if spec.price:

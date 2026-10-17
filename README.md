@@ -17,8 +17,9 @@ Claude or OpenAI's GPT models through their APIs, which sends the texts to the p
   that you can save as your own presets.
 - **14 curated local models** from 350M to 9B parameters, all of which fit an 8 GB GPU at 4-bit.
   You can also use any Hugging Face repo id or a model folder on disk.
-- **Cloud models too.** Claude (Anthropic) and GPT (OpenAI) through their APIs, no GPU needed, with
-  the tokens and list-price cost shown before each run. OpenAI-compatible servers work as well.
+- **Cloud models too.** Claude (Anthropic) and GPT (OpenAI) through their APIs, no GPU needed. The
+  Run page estimates the tokens before each run, and the list-price cost for Claude models.
+  OpenAI-compatible servers work as well.
 - **Resumable runs.** Each output is saved as soon as its batch finishes. Re-running the same
   configuration is instant, an interrupted run picks up where it stopped, and only failed rows are
   retried.
@@ -338,35 +339,43 @@ fine-tune such as `openai:ft:gpt-6-luna:acme::abc123`.
 - **Install** the SDKs with the `api` extra: `pip install -e ".[api]"` (with local models too:
   `".[llm,api]"`). It adds `anthropic`, `openai` and `keyring`.
 - **API keys.** The app looks for a key, first match wins:
-  1. A key entered on **Models & settings** for this session only. It is kept in memory until the
-     app stops.
+  1. A key entered on **Models & settings** with **Use for this session**. It is kept in memory
+     until the app stops, and every browser tab of the app uses it.
   2. The `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` environment variable.
   3. A key saved from **Models & settings** in the system keyring: Windows Credential Manager, the
      macOS Keychain, or the Secret Service on Linux.
 
-  Keys are never written to the results database or the log, and the app only ever shows their
-  first and last characters. **Test connection** on the same page checks a key.
-- **Before a run**, the Run page says how many texts will be sent, about how many tokens that is,
-  and, for models with a known price, the most it should cost. Reasoning tokens are extra. Tick
-  **Send these texts to Anthropic** (or OpenAI) once per browser session to run a cloud model.
-  After the run, **Results → Details** shows the tokens used and their cost at list price.
+  Keys are never written to the results database or the log, and the app only ever shows a few
+  of their characters. **Test connection** on the same page checks a key. Without a key, the
+  Anthropic SDK can also sign in with `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_PROFILE`.
+- **Before a run**, the Run page says how many texts will be sent and about how many tokens that
+  is. For models with a known price (the Claude models above) it also gives the approximate cost
+  at list prices, not counting reasoning tokens. Tick **Send these texts to Anthropic** (or
+  OpenAI, or the server set in `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) to run a cloud model. The
+  tick is asked again for another file, text column, row selection or provider. Retrying failed
+  rows, or generating the remaining ones, from the Results page sends those rows to the same
+  provider without asking again. After the run, **Results → Details** shows the tokens used, and
+  their cost at list prices where the price is known.
 - **Batch size** means requests sent at once for a cloud model. Each text is its own request. The
   SDKs retry rate limits, overload, timeouts and network errors 4 times, with backoff. If rows
   still fail with a rate-limit error, lower the batch size and run again: only the failed rows are
   retried.
 - **One failed text doesn't stop the run.** A text the provider refuses, filters out or rejects
   as too long becomes an error row, with the provider's reason. The rest of its batch is kept, and
-  nothing is sent twice. A rejected key, or a model the key can't use, stops the run at once.
+  a later run sends only the texts that don't have an answer yet. A rejected key, a model the key
+  can't use, or an account out of credit stops the run at once.
 - **Request settings** favour short, cheap answers. The app uses the lowest reasoning effort each
-  model accepts, temperature 0 where the model allows it, and room for the model's reasoning on
-  top of **Max output tokens**. On OpenAI, the app learns which of these settings a model
-  rejects, from the error, and drops them.
+  model accepts and adds room for the model's reasoning on top of **Max output tokens**. OpenAI
+  models also get temperature 0 where they allow it. On OpenAI, the app learns which of these
+  settings a model rejects, from the error, and drops them.
 - **Saved outputs** work as for local models: a re-run of the same model, prompt and settings
   sends nothing and costs nothing. Outputs are filed under the model id, so if a provider updates
   the model behind an id, use **Discard saved outputs** on the Run page to generate afresh.
 - **OpenAI-compatible servers.** These include Azure OpenAI, vLLM, LM Studio and Ollama. Set
-  `OPENAI_BASE_URL` to the server's address, then enter its model as `openai:<model id>`. A
-  server that checks no key needs no `OPENAI_API_KEY`.
+  `OPENAI_BASE_URL` to the server's address, then enter its model as `openai:<model id>`. The
+  server receives the texts and the OpenAI key, if one is set; a server that checks no key needs
+  no `OPENAI_API_KEY`. No reasoning effort is sent to these servers. `ANTHROPIC_BASE_URL` does the
+  same for `anthropic:` models (a company gateway, say).
 - **Company networks.** The SDKs use the same certificate handling as model downloads (see
   [Corporate networks](#corporate-networks)) and honour `HTTPS_PROXY`.
 
@@ -582,7 +591,10 @@ and `batchtextreview -v ui` sets `BTR_VERBOSE`.
 | `HF_TOKEN` | | Hugging Face access token, needed for gated models. |
 | `ANTHROPIC_API_KEY` | | Anthropic API key, for Claude models (or add one on **Models & settings**). |
 | `OPENAI_API_KEY` | | OpenAI API key, for GPT models (or add one on **Models & settings**). |
-| `OPENAI_BASE_URL` | OpenAI | Address of an OpenAI-compatible server to send `openai:` models to. |
+| `OPENAI_BASE_URL` | OpenAI | Address of an OpenAI-compatible server to send `openai:` models to. It receives the texts and the OpenAI key. |
+| `ANTHROPIC_BASE_URL` | Anthropic | Address of another server (a company gateway, say) to send `anthropic:` models to. It receives the texts and the Anthropic key. |
+| `ANTHROPIC_AUTH_TOKEN` | | An Anthropic OAuth token, used when no Anthropic API key is set. |
+| `ANTHROPIC_PROFILE` | | An Anthropic sign-in profile saved by `ant auth login`, used when no Anthropic API key is set. |
 | `HF_HUB_OFFLINE` | off | `1` never contacts huggingface.co and loads models only from the local cache. |
 | `HF_HOME` | `~/.cache/huggingface` | Where downloaded models are kept. Move it to a disk with space. |
 
