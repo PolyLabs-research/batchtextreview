@@ -34,9 +34,9 @@ PRECISION_LABELS: dict[str, str] = {
 class Backend(Protocol):
     """A loaded model.
 
-    Optional attribute, deliberately not a protocol member (so a backend
-    without it still satisfies ``isinstance(x, Backend)``); read it with
-    ``getattr(backend, "last_hit_limit", None)``:
+    Optional attributes, deliberately not protocol members (so a backend
+    without them still satisfies ``isinstance(x, Backend)``); read them with
+    ``getattr(backend, name, None)``:
 
     ``last_hit_limit: list[bool]``
         Set by every ``generate()`` call: one flag per prompt of that call,
@@ -44,6 +44,14 @@ class Backend(Protocol):
         ``max_new_tokens`` rather than finished (so a label may be
         incomplete). Empty after a call that raised. A backend that can't
         tell doesn't have the attribute.
+    ``last_row_errors: list[str | None]``
+        Set by every ``generate()`` call of a backend that answers each
+        prompt separately (the cloud APIs): an error message for each prompt
+        that failed on its own - its output is then "" - and None for the
+        others. ``generate()`` raises only when the whole call failed.
+    ``last_usage: tuple[int, int]``
+        (input tokens, output tokens) the last ``generate()`` call used, as
+        the provider counted them.
     """
 
     model_id: str
@@ -76,6 +84,12 @@ class ModelLoadError(BackendError):
 
 class GenerationError(BackendError):
     """A generation call failed for a reason other than one row's content."""
+
+    def __init__(self, message: str, hint: str | None = None, *, fatal: bool = False) -> None:
+        super().__init__(message, hint)
+        self.fatal = fatal
+        """No later call can succeed either (a rejected API key, a model the
+        key can't use): the engine stops the run instead of retrying."""
 
 
 @dataclass(frozen=True)

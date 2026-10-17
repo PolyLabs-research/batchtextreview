@@ -226,11 +226,83 @@ def error_with_details(message: str, details: str | None = None, hint: str | Non
 # ---------------------------------------------------------------------------
 
 
+KEY_SOURCE_WORDS: dict[str, str] = {
+    "session": "entered for this session",
+    "env": "from {env}",
+    "keyring": "saved in the system keyring",
+}
+
+
+def key_status(provider: str) -> tuple[bool, str]:
+    """(credentials available, a few words saying where they come from) for
+    a cloud provider. Never shows the key itself."""
+    from batchtextreview import api_keys
+
+    source = api_keys.key_source(provider)
+    if source is not None:
+        words = KEY_SOURCE_WORDS[source].format(env=api_keys.ENV_VARS[provider])
+        return True, f"Key {words}"
+    if api_keys.credentials_available(provider):
+        return True, "No key needed: OPENAI_BASE_URL is set" if provider == "openai" else (
+            "Signed in without a key"
+        )
+    return False, "No API key"
+
+
+def _api_badges(spec: ModelSpec) -> None:
+    from batchtextreview import api_keys
+    from batchtextreview.models import PRICES_AS_OF
+
+    provider = spec.provider_label
+    who = api_keys.recipient(spec.provider or "")
+    if who == provider:
+        st.badge(
+            f"{provider} API",
+            icon=":material/cloud:",
+            color="blue",
+            help=f"Runs on {provider}'s servers: the texts you run are sent to {provider}, "
+            "and the requests are billed to your API account.",
+        )
+    else:
+        variable = api_keys.BASE_URL_VARS[spec.provider or "openai"]
+        st.badge(
+            f"{provider} API · {fmt.md(who)}",
+            icon=":material/cloud:",
+            color="violet",
+            help=f"{variable} is set: the texts you run are sent to {who}, not to {provider}.",
+        )
+    if spec.tier:
+        st.badge(spec.tier.capitalize(), icon=":material/speed:", color="blue")
+    if spec.price:
+        st.badge(
+            fmt.no_math(fmt.price(spec.price)),
+            color="gray",
+            help=f"List price per million input / output tokens ({PRICES_AS_OF}). Check "
+            f"{provider}'s pricing page for the current price.",
+        )
+    ok, words = key_status(spec.provider or "")
+    if ok:
+        st.badge(words, icon=":material/key:", color="green")
+    else:
+        st.badge(
+            words,
+            icon=":material/key_off:",
+            color="orange",
+            help="Add a key on the Models & settings page, or set "
+            f"{'ANTHROPIC_API_KEY' if spec.provider == 'anthropic' else 'OPENAI_API_KEY'} "
+            "and restart the app.",
+        )
+
+
 def model_badges(spec: ModelSpec, device: DeviceInfo) -> None:
     """Inline badges for a model: size, tier, "Gated" (orange, with a note
     whether a token is available), "Experimental" (violet), "Local folder",
-    and whether the model is downloaded."""
+    and whether the model is downloaded. A cloud model: its provider, tier,
+    list price and whether a key is set."""
     with st.container(horizontal=True, gap="xsmall"):
+        if spec.is_api:
+            _api_badges(spec)
+            return
         if spec.is_demo:
             st.badge(
                 "Instant fake outputs",

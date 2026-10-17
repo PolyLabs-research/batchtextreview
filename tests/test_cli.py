@@ -1752,3 +1752,70 @@ def test_broken_pipe_exits_quietly(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_cmd_presets", closed_pipe)
     assert cli.main(["presets"]) == cli.EXIT_OK
     assert "Traceback" not in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Cloud models
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_api_keys(monkeypatch):
+    from batchtextreview import api_keys
+
+    for name in (
+        *api_keys.ENV_VARS.values(),
+        "OPENAI_BASE_URL",
+        *api_keys.ANTHROPIC_OTHER_CREDENTIALS,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(api_keys, "_keyring_backend", lambda: None)
+    api_keys._reset_for_tests()
+    yield
+    api_keys._reset_for_tests()
+
+
+def test_models_command_lists_cloud_models(capsys):
+    code, out, _err = run_cli(capsys, "models")
+    assert code == 0
+    assert "anthropic:claude-haiku-5-5" in out and "$0.10 / $0.50" in out
+    assert "openai:gpt-6-luna" in out and "OPENAI_API_KEY" in out
+
+
+def test_cloud_model_without_a_key_fails_before_reading_anything(
+    capsys, data_file, results, no_api_keys
+):
+    pytest.importorskip("anthropic")
+    code, _out, err = run_cli(
+        capsys, "run", str(data_file), "--model", "anthropic:claude-haiku-5-5",
+        "--preset", "Sentiment", "--results-dir", str(results),
+    )  # fmt: skip
+    assert code != 0
+    assert "No Anthropic API key is set. Set ANTHROPIC_API_KEY" in err
+
+
+def test_cloud_model_run_reports_tokens_and_cost(
+    capsys, data_file, results, monkeypatch, no_api_keys
+):
+    pytest.importorskip("anthropic")
+    from batchtextreview.backends.fake import FakeBackend
+
+    class Metered(FakeBackend):
+        def generate(self, prompts, max_new_tokens):
+            outputs = super().generate(prompts, max_new_tokens)
+            self.last_usage = (1000 * len(prompts), 10 * len(prompts))
+            return outputs
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setattr(
+        cli, "default_factory", lambda model_id, precision: Metered(model_id, "none")
+    )
+    code, out, err = run_cli(
+        capsys, "run", str(data_file), "--model", "Claude Haiku 5.5", "--preset", "Sentiment",
+        "--results-dir", str(results),
+    )  # fmt: skip
+    assert code == 0, err
+    assert "Claude Haiku 5.5 (Anthropic API)" in err
+    assert "will be sent to Anthropic" in err
+    combined = out + err
+    assert "input and" in combined and "output tokens (about $" in combined

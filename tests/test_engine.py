@@ -2114,3 +2114,83 @@ def test_retrained_local_model_is_neither_served_from_cache_nor_kept_loaded(tmp_
     store.delete_run(old_config.run_id)
     assert execute_run(old_config, texts, store=store, manager=manager).outputs == fresh.outputs
     manager.unload()
+
+
+# --------------------------------------------------------------------------
+# Backends that answer each prompt separately (cloud APIs)
+# --------------------------------------------------------------------------
+
+
+class PerRowBackend(ScriptedBackend):
+    """Reports a failed prompt in ``last_row_errors`` instead of raising,
+    and its token usage in ``last_usage``, like the API backends."""
+
+    def __init__(self, failing: set[str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.failing = failing
+        self.last_row_errors: list[str | None] = []
+        self.last_usage = (0, 0)
+
+    def generate(self, prompts: Sequence[str], max_new_tokens: int) -> list[str]:
+        self.calls.append(list(prompts))
+        self.last_row_errors = [
+            f"declined {p}" if p[len("Q: ") :] in self.failing else None for p in prompts
+        ]
+        self.last_usage = (10 * len(prompts), 2 * len(prompts))
+        return [
+            "" if e else self.responder(p)
+            for p, e in zip(prompts, self.last_row_errors, strict=True)
+        ]
+
+
+def test_rows_that_fail_on_their_own_keep_the_rest_of_their_batch():
+    store = FakeStore()
+    backend = PerRowBackend({"b", "d"})
+    result, _ = run(["a", "b", "c", "d"], store=store, manager=FakeManager(backend), batch_size=4)
+    check_stats(result)
+    assert result.statuses == ["generated", "error", "generated", "error"]
+    assert result.outputs == ["A:A", "", "A:C", ""]
+    assert result.errors[1] == "declined Q: b" and result.errors[3] == "declined Q: d"
+    assert len(backend.calls) == 1  # nothing retried or sent twice
+    assert set(store.outputs[make_config().run_id].values()) == {"A:A", "A:C"}
+    assert result.aborted_reason is None
+    assert (result.stats.input_tokens, result.stats.output_tokens) == (40, 8)
+
+
+def test_batches_whose_rows_all_fail_count_as_failed_batches():
+    backend = PerRowBackend({"a", "b", "c", "d", "e", "f"})
+    result, _ = run(
+        list("abcdef"), manager=FakeManager(backend), batch_size=2, max_consecutive_failures=2
+    )
+    check_stats(result)
+    assert result.aborted_reason is not None and "declined" in result.aborted_reason
+    assert result.statuses.count("pending") == 2  # the third batch never ran
+    assert len(backend.calls) == 2
+
+
+def test_a_fatal_backend_error_stops_the_run_at_once():
+    from batchtextreview.backends.base import GenerationError
+
+    error = GenerationError("OpenAI rejected the API key.", "Add a key.", fatal=True)
+    backend = ScriptedBackend(fail_when=lambda n, prompts: True, error=error)
+    result, _ = run(list("abcdef"), manager=FakeManager(backend), batch_size=2)
+    check_stats(result)
+    assert len(backend.calls) == 1  # no one-row retries, no further batches
+    assert result.statuses[:2] == ["error", "error"] and result.stats.pending == 4
+    assert result.aborted_reason == "OpenAI rejected the API key. Add a key."
+
+
+def test_row_error_of_a_retried_row_is_reported():
+    # A batch that raised is retried row by row; a row the backend then
+    # reports failed is an error row with that message.
+    class Flaky(PerRowBackend):
+        def generate(self, prompts, max_new_tokens):
+            if len(prompts) > 1:
+                self.calls.append(list(prompts))
+                raise RuntimeError("batch failed")
+            return super().generate(prompts, max_new_tokens)
+
+    result, _ = run(["a", "b"], manager=FakeManager(Flaky({"b"})), batch_size=2)
+    check_stats(result)
+    assert result.statuses == ["generated", "error"]
+    assert result.errors[1] == "declined Q: b"

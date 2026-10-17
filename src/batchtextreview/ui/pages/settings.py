@@ -1,9 +1,9 @@
 """Models & settings page: this computer, the loaded model, the model
-catalogue, saved outputs and where everything is stored.
+catalogue, cloud model keys, saved outputs and where everything is stored.
 
-Read-only except for two actions - unload the model, and delete one
-configuration's saved outputs (behind a confirm dialog) - both disabled while
-a run is in progress. Nothing here imports torch: the GPU memory readout
+Read-only except for unloading the model and deleting one configuration's
+saved outputs (behind a confirm dialog) - both disabled while a run is in
+progress - and managing the cloud providers' API keys. Nothing here imports torch: the GPU memory readout
 only appears when torch is already loaded (the device check imports it).
 """
 
@@ -21,7 +21,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from batchtextreview import __version__, models, presets
+from batchtextreview import __version__, api_keys, models, presets
 from batchtextreview import store as store_mod
 from batchtextreview.backends.base import PRECISION_LABELS, DeviceInfo, resolve_precision
 from batchtextreview.config import ENV_DATA_DIR, ENV_DEMO, ENV_RESULTS_DIR, hf_token_present
@@ -38,6 +38,10 @@ _K_SELECTED_RUN = "settings.selected_run"
 """run_id selected in the saved-outputs table (or None)."""
 _K_RUN_DELETED = "settings.run_deleted"
 _K_RUN_MSG = "settings.run_msg"
+K_KEY_INPUT = "settings.api_key"
+"""Prefix of each provider's key input (``settings.api_key::anthropic``)."""
+_K_KEY_MSG = "settings.api_key_msg"
+"""Prefix of each provider's last key action / connection test result."""
 
 _GB = 1024**3
 _DATE_FORMAT = "D MMM YYYY, HH:mm"
@@ -48,6 +52,12 @@ _ENV_VARS: tuple[tuple[str, str], ...] = (
     (ENV_DEMO, "1 adds the Demo model: instant fake outputs, no GPU needed."),
     ("HF_TOKEN", "Hugging Face token, needed for gated models such as Llama."),
     ("HF_HUB_OFFLINE", "1 never contacts Hugging Face: only downloaded models can load."),
+    ("ANTHROPIC_API_KEY", "Anthropic API key, for Claude models (see Cloud models above)."),
+    ("OPENAI_API_KEY", "OpenAI API key, for GPT models (see Cloud models above)."),
+    (
+        "OPENAI_BASE_URL",
+        "Address of an OpenAI-compatible server (Azure, a local server) to use instead of OpenAI.",
+    ),
     (
         "BTR_NO_TRUSTSTORE",
         "1 stops using the operating system's certificates for HTTPS (they are used by "
@@ -69,7 +79,8 @@ _ENV_VARS: tuple[tuple[str, str], ...] = (
 def render() -> None:
     components.page_header(
         "Models & settings",
-        "This computer, the model catalogue, saved outputs and where everything is stored.",
+        "This computer, the model catalogue, cloud model keys, saved outputs and where "
+        "everything is stored.",
     )
     settings = resources.get_settings()
     store = resources.get_store()
@@ -92,6 +103,8 @@ def render() -> None:
 
     st.space("small")
     _catalogue(device)
+    st.space("small")
+    _cloud_models()
     st.space("small")
     _saved_outputs(saved, busy)
     st.space("small")
@@ -210,8 +223,8 @@ def device_note(device: DeviceInfo, demo: bool) -> tuple[str, str, str] | None:
     if device.kind == "none":
         return (
             "PyTorch isn't installed",
-            "Only the demo model can run. Install PyTorch and transformers (see the README) "
-            "to run real models. " + demo_hint,
+            "Local models need PyTorch and transformers (see the README). Cloud models "
+            "(Anthropic, OpenAI) run without them. " + demo_hint,
             "info" if demo else "warning",
         )
     if device.kind == "cpu":
@@ -417,6 +430,211 @@ def _catalogue(device: DeviceInfo) -> None:
     if device.kind in ("cpu", "none"):
         caption += " On this computer, prefer the smallest models."
     st.caption(caption)
+
+
+# ==========================================================================
+# Cloud models
+# ==========================================================================
+
+
+def _cloud_models() -> None:
+    st.subheader("Cloud models", anchor=False)
+    st.caption(
+        "Anthropic's Claude and OpenAI's GPT models run on the providers' servers: the texts "
+        "you run are sent to them, and the requests are billed to your API account. Each "
+        "needs an API key. Keys are never written to the results database or the log, and "
+        "only their first and last characters are shown."
+    )
+    columns = st.columns(len(models.API_PROVIDERS), gap="medium")
+    for column, provider in zip(columns, models.API_PROVIDERS, strict=True):
+        with column:
+            _provider_card(provider)
+
+
+def keyring_name() -> str:
+    """What the system keyring is called on this operating system."""
+    if sys.platform == "win32":
+        return "Windows Credential Manager"
+    if sys.platform == "darwin":
+        return "the macOS Keychain"
+    return "the system keyring"
+
+
+def _provider_card(provider: str) -> None:
+    from batchtextreview.backends import api
+
+    name = models.API_PROVIDERS[provider]
+    env_var = api_keys.ENV_VARS[provider]
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            st.markdown(f"**{name}**", width="content")
+            ok, words = components.key_status(provider)
+            st.badge(
+                words,
+                icon=":material/key:" if ok else ":material/key_off:",
+                color="green" if ok else "orange",
+            )
+        found = api_keys.lookup(provider)
+        if found is not None:
+            st.caption(f"Key in use: `{api_keys.masked(found[0])}`")
+        base_url = api_keys.base_url(provider)
+        if base_url:
+            st.caption(
+                f"Requests go to {fmt.md(base_url)} ({api_keys.BASE_URL_VARS[provider]}), "
+                f"not to {name}."
+            )
+        installed = api.sdk_installed(provider)
+        if not installed:
+            st.warning(
+                f"The {api.SDK_PACKAGES[provider]} package isn't installed. Install the cloud "
+                'API extra (pip install -e ".[api]"), then restart the app.',
+                icon=":material/extension_off:",
+            )
+
+        can_save = api_keys.keyring_available()
+        # Buttons with callbacks, not a form: the callback empties the field,
+        # so the typed key doesn't linger in the session state.
+        st.text_input(
+            f"{name} API key",
+            type="password",
+            key=f"{K_KEY_INPUT}::{provider}",
+            placeholder="sk-ant-…" if provider == "anthropic" else "sk-…",
+            help=f"“Use for this session” comes before {env_var}; a saved key is used "
+            f"only when {env_var} isn't set.",
+        )
+        with st.container(horizontal=True, gap="small"):
+            st.button(
+                "Use for this session",
+                key=f"settings.api_use::{provider}",
+                icon=":material/login:",
+                on_click=_use_typed_key,
+                args=(provider, False),
+                help="Until the app stops, for every browser tab of this app.",
+            )
+            st.button(
+                "Save",
+                key=f"settings.api_save::{provider}",
+                icon=":material/save:",
+                disabled=not can_save,
+                on_click=_use_typed_key,
+                args=(provider, True),
+                help=f"Saves the key in {keyring_name()}, so later sessions use it too."
+                if can_save
+                else "No system keyring is available here: set "
+                f"{env_var} instead, or install the keyring package.",
+            )
+
+        source = found[1] if found is not None else None
+        with st.container(horizontal=True, gap="small"):
+            if st.button(
+                "Test connection",
+                key=f"settings.api_test::{provider}",
+                icon=":material/network_check:",
+                disabled=not (installed and ok),
+                help=f"Asks {name} for the models this key can use.",
+            ):
+                _test_connection(provider)
+            if source == "session" and st.button(
+                "Forget",
+                key=f"settings.api_forget::{provider}",
+                icon=":material/logout:",
+                type="tertiary",
+                help="Stop using the key entered for this session.",
+            ):
+                api_keys.set_session_key(provider, None)
+                _set_key_message(provider, "info", "The session key is forgotten.")
+                st.rerun()
+            if api_keys.saved_key(provider) and st.button(
+                "Remove saved key",
+                key=f"settings.api_remove::{provider}",
+                icon=":material/delete:",
+                type="tertiary",
+                help=f"Deletes the key saved in {keyring_name()}.",
+            ):
+                try:
+                    api_keys.delete_saved_key(provider)
+                except RuntimeError as exc:
+                    _set_key_message(provider, "error", str(exc))
+                else:
+                    _set_key_message(provider, "info", "The saved key is removed.")
+                st.rerun()
+        message = st.session_state.get(f"{_K_KEY_MSG}::{provider}")
+        if message:
+            kind, text = message
+            {"success": st.success, "error": st.error, "warning": st.warning}.get(kind, st.info)(
+                text
+            )
+        builtin = models.api_models(provider)
+        if builtin:
+            st.caption(
+                "Built in: "
+                + " · ".join(
+                    f"{s.label} ({fmt.no_math(fmt.price(s.price))})" if s.price else s.label
+                    for s in builtin
+                )
+                + f". Any other model works as {provider}:<model id> through “Custom model…” "
+                "on the Run page."
+            )
+
+
+def _use_typed_key(provider: str, save: bool) -> None:
+    """Button callback: use or save the key typed in, then empty the field."""
+    field = f"{K_KEY_INPUT}::{provider}"
+    typed = str(st.session_state.get(field) or "")
+    st.session_state[field] = ""
+    _store_key(provider, typed, save=save)
+
+
+def _store_key(provider: str, key: str, *, save: bool) -> None:
+    value = (key or "").strip()
+    if not value:
+        _set_key_message(provider, "error", "Enter a key first.")
+        return
+    if save:
+        try:
+            api_keys.save_key(provider, value)
+        except (RuntimeError, ValueError) as exc:
+            _set_key_message(provider, "error", str(exc))
+            return
+        # A session key would hide the one just saved.
+        api_keys.set_session_key(provider, None)
+        env_var = api_keys.ENV_VARS[provider]
+        if os.environ.get(env_var, "").strip():
+            _set_key_message(
+                provider,
+                "warning",
+                f"Saved in {keyring_name()}, but {env_var} is set and is used first. Unset it "
+                "and restart the app to use the saved key.",
+            )
+        else:
+            _set_key_message(provider, "success", f"Saved in {keyring_name()}.")
+    else:
+        api_keys.set_session_key(provider, value)
+        _set_key_message(provider, "success", "Used until the app stops.")
+
+
+def _test_connection(provider: str) -> None:
+    from batchtextreview.backends import api
+    from batchtextreview.backends.base import ModelLoadError
+
+    name = models.API_PROVIDERS[provider]
+    try:
+        with st.spinner(f"Asking {name}…"):
+            ids = api.check_connection(provider)
+    except ModelLoadError as exc:
+        _set_key_message(provider, "error", str(exc))
+        return
+    except Exception as exc:  # unexpected: show it rather than crash the page
+        _set_key_message(provider, "error", f"{type(exc).__name__}: {exc}")
+        return
+    known = [s.api_model for s in models.api_models(provider) if s.api_model in ids]
+    text = f"Connected: this key can use {fmt.plural(len(ids), 'model')}"
+    text += f", including {', '.join(known)}." if known else "."
+    _set_key_message(provider, "success", text)
+
+
+def _set_key_message(provider: str, kind: str, text: str) -> None:
+    st.session_state[f"{_K_KEY_MSG}::{provider}"] = (kind, text)
 
 
 def download_range(specs: list[models.ModelSpec]) -> str:
@@ -796,7 +1014,9 @@ def env_table(
     rows = []
     for name, purpose in _ENV_VARS:
         raw = (env.get(name) or "").strip()
-        if name == "HF_TOKEN":
+        if name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+            value = "Set (hidden)" if raw else "Not set"
+        elif name == "HF_TOKEN":
             if hf_token_present(env):
                 value = "Set (hidden)"
             elif login_token:

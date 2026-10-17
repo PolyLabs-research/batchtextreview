@@ -12,7 +12,9 @@ Run page; it has its own tests.
 
 from __future__ import annotations
 
+import math
 import re
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -24,6 +26,7 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+from batchtextreview import models
 from batchtextreview.engine import Progress
 from batchtextreview.jobs import JobSnapshot
 from batchtextreview.ui import components, state
@@ -1141,3 +1144,172 @@ def test_progress_bar_measures_work(
     assert len(bars) == 1
     assert bars[0].proto.value == 37
     assert re.match(r"\d / 6 rows", bars[0].proto.text)
+
+
+# ---- cloud models -------------------------------------------------------------
+
+
+@pytest.fixture
+def no_api_keys(monkeypatch: pytest.MonkeyPatch):
+    from batchtextreview import api_keys
+
+    for name in (
+        *api_keys.ENV_VARS.values(),
+        "OPENAI_BASE_URL",
+        *api_keys.ANTHROPIC_OTHER_CREDENTIALS,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(api_keys, "_keyring_backend", lambda: None)
+    api_keys._reset_for_tests()
+    yield
+    api_keys._reset_for_tests()
+
+
+HAIKU = "anthropic:claude-haiku-5-5"
+
+
+@pytest.mark.ui
+def test_cloud_model_without_a_key_cannot_run(app: AppTest, data_dir: Path, no_api_keys) -> None:
+    pytest.importorskip("anthropic")
+    at = _load_feedback(app, data_dir)
+    assert "Claude Haiku 5.5 · Anthropic API" in at.selectbox(key=run_page.MODEL_KEY).options
+    at.selectbox(key=run_page.MODEL_KEY).set_value(HAIKU).run()
+    assert not at.exception
+    text = _markdown(at)
+    assert "Anthropic API" in text and "No API key" in text
+    assert "\\$0.10 / \\$0.50 per M tokens" in text  # escaped: not LaTeX
+    button = at.button(key=run_page.RUN_BUTTON_KEY)
+    assert button.disabled
+    assert "No Anthropic API key is set" in text
+    assert at.segmented_control(key=run_page.PRECISION_KEY).disabled
+    assert "requests at once" in text and "weights" not in text.split("requests at once")[1][:40]
+
+
+@pytest.mark.ui
+def test_cloud_model_asks_before_sending_the_texts(
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, no_api_keys
+) -> None:
+    pytest.importorskip("anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-0000")
+    _use_backend(monkeypatch)  # no request leaves the test
+    at = _load_feedback(app, data_dir)
+    at.selectbox(key=run_page.MODEL_KEY).set_value(HAIKU).run()
+    assert not at.exception
+    text = _markdown(at)
+    assert "Key from ANTHROPIC_API_KEY" in text
+    # 6 rows: 1 blank and 1 duplicate, so 4 distinct texts are sent.
+    assert "Sends 4 texts to Anthropic: about" in text and "at list prices" in text
+    button = at.button(key=run_page.RUN_BUTTON_KEY)
+    assert button.disabled and "Tick “Send these texts to Anthropic”" in text
+    consent = _consent_box(at)
+    assert consent.value is False
+    consent.check().run()
+    assert not at.button(key=run_page.RUN_BUTTON_KEY).disabled
+    at.button(key=run_page.RUN_BUTTON_KEY).click().run()
+    assert not at.exception
+    job = _job_manager().get(at.session_state[state.SESSION_JOBS][0])
+    assert job is not None and job.wait(15) and job.snapshot().state == "succeeded"
+    assert job.request.config.model_id == HAIKU
+    assert job.request.config.precision == "none"
+
+
+def _consent_box(at: AppTest, who: str = "Anthropic"):
+    return next(c for c in at.checkbox if c.label == f"Send these texts to {who}")
+
+
+@pytest.mark.ui
+def test_consent_is_needed_even_when_saved_outputs_cannot_be_checked(
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, no_api_keys
+) -> None:
+    pytest.importorskip("anthropic")
+    from batchtextreview import engine
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-0000")
+    _use_backend(monkeypatch)
+    at = _load_feedback(app, data_dir)
+    real_plan = engine.plan_run
+
+    def broken_on_the_page(config, texts, store, *args, **kwargs):
+        if not threading.current_thread().name.startswith("btr-job"):  # the page, not a run
+            raise sqlite3.OperationalError("database is locked")
+        return real_plan(config, texts, store, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "plan_run", broken_on_the_page)
+    at.selectbox(key=run_page.MODEL_KEY).set_value(HAIKU).run()
+    assert not at.exception
+    assert "Couldn't check for saved outputs" in " ".join(w.value for w in at.warning)
+    assert "will be sent to Anthropic" in _markdown(at)
+    assert at.button(key=run_page.RUN_BUTTON_KEY).disabled
+    _consent_box(at).check().run()
+    assert not at.button(key=run_page.RUN_BUTTON_KEY).disabled
+
+
+@pytest.mark.ui
+def test_a_tick_does_not_carry_over_to_other_texts(
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, no_api_keys
+) -> None:
+    pytest.importorskip("anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-0000")
+    other = pd.DataFrame(ROWS[:3], columns=["INDEX", "TEXT", "GOLD_SENTIMENT", "GOLD_INTENT"])
+    other.to_csv(data_dir / "other.csv", index=False)
+    at = _load_feedback(app, data_dir)
+    at.selectbox(key=run_page.MODEL_KEY).set_value(HAIKU).run()
+    _consent_box(at).check().run()
+    assert not at.button(key=run_page.RUN_BUTTON_KEY).disabled
+    at.selectbox(key=run_page.FOLDER_FILE_KEY).set_value(str(data_dir / "other.csv")).run()
+    assert not at.exception
+    assert _consent_box(at).value is False
+    assert at.button(key=run_page.RUN_BUTTON_KEY).disabled
+
+
+@pytest.mark.ui
+def test_cost_reads_about_and_never_at_most(
+    app: AppTest, data_dir: Path, monkeypatch: pytest.MonkeyPatch, no_api_keys
+) -> None:
+    pytest.importorskip("anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-0000")
+    at = _load_feedback(app, data_dir)
+    at.selectbox(key=run_page.MODEL_KEY).set_value(HAIKU).run()
+    text = _markdown(at)
+    assert "under \\$0.01 at list prices" in text and "at most" not in text
+
+
+@pytest.mark.ui
+def test_without_pytorch_the_page_starts_on_a_cloud_model(
+    tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch, no_api_keys
+) -> None:
+    pytest.importorskip("anthropic")
+    from batchtextreview.backends.base import DeviceInfo
+    from batchtextreview.ui import resources
+
+    monkeypatch.delenv("BTR_DEMO", raising=False)
+    monkeypatch.setenv("BTR_RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setenv("BTR_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-0000")
+    monkeypatch.setattr(
+        resources, "get_device_info", lambda: DeviceInfo(kind="none", name="PyTorch not installed")
+    )
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    at = AppTest.from_file(str(APP), default_timeout=TIMEOUT).run()
+    assert not at.exception
+    assert at.selectbox(key=run_page.MODEL_KEY).value == HAIKU
+    at.selectbox(key=run_page.MODEL_KEY).set_value("Qwen/Qwen2.5-1.5B-Instruct").run()
+    at.segmented_control(key=run_page.SOURCE_KEY).set_value("path").run()
+    at.selectbox(key=run_page.FOLDER_FILE_KEY).set_value(str(data_dir / "feedback.csv")).run()
+    assert "local models can't run here. Choose a cloud model" in _markdown(at)
+    st.cache_resource.clear()
+
+
+def test_api_usage_estimate_counts_texts_not_saved_yet() -> None:
+    from batchtextreview import engine
+
+    spec = models.find_model(HAIKU)
+    assert spec is not None
+    config = engine.RunConfig.build(spec, "Label: {text}", 8)
+    texts = ["abcd" * 10, "", "abcd" * 10, "xy" * 50]
+    plan = engine.plan_run(config, texts, None)
+    calls, sent, answers = run_page.api_usage_estimate(plan, config)
+    assert calls == 2 and answers == 16
+    # "Label: " (7 characters) + the text, at 4 characters a token.
+    assert sent == math.ceil((7 + 40 + 7 + 100) / run_page.CHARS_PER_TOKEN)

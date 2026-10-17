@@ -464,3 +464,125 @@ def test_loaded_model_card_says_memory_on_a_cpu(monkeypatch):
     captions = texts(at, "caption")
     assert "Unload it to free memory for other programs." in captions
     assert "GPU memory" not in captions
+
+
+# ---- cloud models ------------------------------------------------------------
+
+
+@pytest.fixture
+def no_api_keys(monkeypatch):
+    """No API key anywhere (environment, keyring, session)."""
+    from batchtextreview import api_keys
+
+    for name in (
+        *api_keys.ENV_VARS.values(),
+        "OPENAI_BASE_URL",
+        *api_keys.ANTHROPIC_OTHER_CREDENTIALS,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(api_keys, "_keyring_backend", lambda: None)
+    api_keys._reset_for_tests()
+    yield api_keys
+    api_keys._reset_for_tests()
+
+
+def _form_button(at: AppTest, label: str, provider: str):
+    action = {"Use for this session": "use", "Save": "save"}[label]
+    return at.button(key=f"settings.api_{action}::{provider}")
+
+
+def test_cloud_models_section_without_keys(no_api_keys):
+    at = open_settings()
+    no_exceptions(at)
+    assert "Cloud models" in [h.value for h in at.subheader]
+    text = every_text(at)
+    assert text.count("No API key") == 2
+    assert "Claude Haiku 5.5 (\\$0.10 / \\$0.50 per M tokens)" in text  # not LaTeX
+    assert "openai:<model id>" in text
+    assert _form_button(at, "Save", "anthropic").disabled  # no keyring here
+    assert at.button(key="settings.api_test::anthropic").disabled
+
+
+def test_a_session_key_is_used_but_never_shown(no_api_keys):
+    secret = "sk-ant-api03-verysecretvalue9876"
+    at = open_settings()
+    at.text_input(key=f"{page.K_KEY_INPUT}::anthropic").input(secret)
+    _form_button(at, "Use for this session", "anthropic").click().run()
+    no_exceptions(at)
+    assert no_api_keys.lookup("anthropic") == (secret, "session")
+    text = every_text(at)
+    assert secret not in text and "verysecret" not in text
+    assert "sk-ant-…9876" in text and "Key entered for this session" in text
+    assert not at.button(key="settings.api_test::anthropic").disabled
+    at.button(key="settings.api_forget::anthropic").click().run()
+    assert no_api_keys.lookup("anthropic") is None
+
+
+def test_an_empty_key_is_not_used(no_api_keys):
+    at = open_settings()
+    _form_button(at, "Use for this session", "openai").click().run()
+    assert "Enter a key first." in texts(at, "error")
+    assert no_api_keys.lookup("openai") is None
+
+
+def test_saving_a_key_in_the_system_keyring(no_api_keys, monkeypatch):
+    saved: dict[str, str] = {}
+
+    class Keyring:  # stands in for the keyring package's functions
+        @staticmethod
+        def set_password(service, name, value):
+            saved[name] = value
+
+        @staticmethod
+        def get_password(service, name):
+            return saved.get(name)
+
+        @staticmethod
+        def delete_password(service, name):
+            saved.pop(name)
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "keyring", Keyring)
+    monkeypatch.setattr(no_api_keys, "_keyring_backend", lambda: object())
+    at = open_settings()
+    at.text_input(key=f"{page.K_KEY_INPUT}::openai").input("sk-proj-savedkey5555")
+    _form_button(at, "Save", "openai").click().run()
+    no_exceptions(at)
+    assert saved == {"openai": "sk-proj-savedkey5555"}
+    assert no_api_keys.lookup("openai") == ("sk-proj-savedkey5555", "keyring")
+    assert "Key saved in the system keyring" in every_text(at)
+    at.button(key="settings.api_remove::openai").click().run()
+    assert saved == {} and no_api_keys.lookup("openai") is None
+
+
+def test_connection_test_reports_what_the_key_can_use(no_api_keys, monkeypatch):
+    from batchtextreview.backends import api
+    from batchtextreview.backends.base import ModelLoadError
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-abcdefghijk4321")
+    monkeypatch.setattr(api, "check_connection", lambda provider: ["gpt-6-luna", "gpt-x"])
+    at = open_settings()
+    assert "Key from OPENAI_API_KEY" in every_text(at)
+    at.button(key="settings.api_test::openai").click().run()
+    assert "Connected: this key can use 2 models, including gpt-6-luna." in texts(at, "success")
+
+    def refuse(provider):
+        raise ModelLoadError("OpenAI rejected the API key (bad key).", "Add a key.")
+
+    monkeypatch.setattr(api, "check_connection", refuse)
+    at.button(key="settings.api_test::openai").click().run()
+    assert "OpenAI rejected the API key (bad key). Add a key." in texts(at, "error")
+
+
+def test_env_table_hides_api_keys(tmp_path):
+    settings = Settings(results_dir=tmp_path, data_dir=tmp_path)
+    frame = page.env_table(
+        settings,
+        {"OPENAI_API_KEY": "sk-secret", "OPENAI_BASE_URL": "http://localhost:8000/v1"},
+    )
+    values = dict(zip(frame["Variable"], frame["Current value"], strict=True))
+    assert values["OPENAI_API_KEY"] == "Set (hidden)"
+    assert values["ANTHROPIC_API_KEY"] == "Not set"
+    assert values["OPENAI_BASE_URL"] == "http://localhost:8000/v1"
+    assert "sk-secret" not in frame.to_csv()

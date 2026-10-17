@@ -1021,3 +1021,14 @@ def test_settings_failure_offers_to_change_settings(frame, monkeypatch):
     labels = [b.label for b in at.button]
     assert "Change settings on the Run page" in labels
     assert not [label for label in labels if label.startswith("Retry")]
+
+
+def test_tokens_used_of_a_cloud_run():
+    stats = RunStats(input_tokens=125_000, output_tokens=2_400)
+    spec = models.find_model("anthropic:claude-haiku-5-5")
+    assert results_page.tokens_used(stats, spec) == "125k in · 2.4k out · ≈ $0.01 at list prices"
+    assert results_page.tokens_used(stats, None) == "125k in · 2.4k out"
+    assert (
+        results_page.tokens_used(RunStats(cached=3), spec) == "None (all rows from saved outputs)"
+    )
+    assert results_page.tokens_used(RunStats(), spec) == "None"
