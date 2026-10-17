@@ -46,6 +46,13 @@ llm = [
     "accelerate>=1.0",
     "bitsandbytes>=0.45; platform_system != 'Darwin'",
 ]
+# Cloud models through the providers' APIs (no GPU needed); keyring saves
+# API keys in the operating system's credential store.
+api = [
+    "anthropic>=1.15",
+    "openai>=3.33",
+    "keyring>=25",
+]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",

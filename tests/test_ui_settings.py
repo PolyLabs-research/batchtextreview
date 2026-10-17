@@ -498,7 +498,7 @@ def test_cloud_models_section_without_keys(no_api_keys):
     assert "Cloud models" in [h.value for h in at.subheader]
     text = every_text(at)
     assert text.count("No API key") == 2
-    assert "Claude Haiku 5.5 ($0.10 / $0.50 per M tokens)" in text
+    assert "Claude Haiku 5.5 (\\$0.10 / \\$0.50 per M tokens)" in text  # not LaTeX
     assert "openai:<model id>" in text
     assert _form_button(at, "Save", "anthropic").disabled  # no keyring here
     assert at.button(key="settings.api_test::anthropic").disabled

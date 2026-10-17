@@ -239,7 +239,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         metavar="NAME",
         required=True,
-        help=f'model name, Hugging Face repo id or local folder (see "{PROG} models")',
+        help="model name, Hugging Face repo id, local folder, or a cloud model as "
+        f'anthropic:<id> / openai:<id> (see "{PROG} models")',
     )
     run.add_argument(
         "--precision",

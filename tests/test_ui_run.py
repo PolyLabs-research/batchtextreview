@@ -1176,7 +1176,7 @@ def test_cloud_model_without_a_key_cannot_run(app: AppTest, data_dir: Path, no_a
     assert not at.exception
     text = _markdown(at)
     assert "Anthropic API" in text and "No API key" in text
-    assert "$0.10 / $0.50 per M tokens" in text
+    assert "\\$0.10 / \\$0.50 per M tokens" in text  # escaped: not LaTeX
     button = at.button(key=run_page.RUN_BUTTON_KEY)
     assert button.disabled
     assert "No Anthropic API key is set" in text
